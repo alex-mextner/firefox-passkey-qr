@@ -214,7 +214,7 @@ def step_firefox() -> None:
           "printf 'Package: *\\nPin: origin packages.mozilla.org\\nPin-Priority: 1000\\n' > /etc/apt/preferences.d/mozilla")
     run(["sh", "-c", sh], sudo=True)
     run(["apt-get", "update"], sudo=True)
-    run(["apt-get", "install", "-y", "firefox"], sudo=True)
+    run(["apt-get", "install", "-y", "--allow-downgrades", "firefox"], sudo=True)  # Ubuntu's transitional package has epoch 1:, so Mozilla's deb counts as a downgrade
     if not DRY_RUN and not Path("/usr/lib/firefox/firefox").exists():
         sys.exit("  deb Firefox did not install; snap left untouched")
     if out(["snap", "list", "firefox"]).startswith("Name") and confirm(
