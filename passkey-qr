@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
-SRC_DIR = HOME / ".local/src"
+SRC_DIR = HOME / "dev"
 BRIDGE_REPO = os.environ.get("PASSKEY_QR_BRIDGE_REPO", "https://github.com/alex-mextner/ha-ble-vhci")
 BRIDGE_DIR = HOME / ".local/share/ha-ble-vhci"
 BRIDGE_CFG = HOME / ".config/ha-ble-vhci"
@@ -362,9 +362,10 @@ def step_extension() -> None:
             nm_dir.mkdir(parents=True, exist_ok=True)
             (nm_dir / manifest).unlink(missing_ok=True)
         run(["ln", "-s", str(src), str(nm_dir / manifest)])
-    xpi = SRC_DIR / f"{XPI_ID}.xpi"
+    xpi = HOME / ".cache/passkey-qr" / f"{XPI_ID}.xpi"
     say(f"  extension: Mozilla-signed {XPI_URL.rsplit('/', 1)[-1]} from the credentialsd release {CREDSD_TAG}")
     if confirm("Download it and open it in Firefox (Firefox will ask you to approve; allow access to all sites)?"):
+        xpi.parent.mkdir(parents=True, exist_ok=True) if not DRY_RUN else None
         run(["curl", "-fsSL", "-o", str(xpi), XPI_URL])
         run(["/usr/lib/firefox/firefox", str(xpi)], check=False) if DRY_RUN else subprocess.Popen(
             ["/usr/lib/firefox/firefox", str(xpi)], start_new_session=True)
