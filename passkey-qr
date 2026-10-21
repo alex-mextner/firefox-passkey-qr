@@ -32,7 +32,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -60,6 +59,7 @@ MOZ_PIN = Path("/etc/apt/preferences.d/mozilla")
 UDEV_RULE = Path("/etc/udev/rules.d/99-vhci.rules")
 UDEV_RULE_TEXT = 'KERNEL=="vhci", TAG+="uaccess", GROUP="plugdev", MODE="0660"\n'
 MODULES_CONF = Path("/etc/modules-load.d/hci_vhci.conf")
+FIREFOX_POLICIES = Path("/etc/firefox/policies/policies.json")
 PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
 PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
@@ -651,22 +651,7 @@ def link_nm() -> None:
     run(["ln", "-sfn", str(nm_target()), str(nm_link())])
 
 
-def xpi_path() -> Path:
-    return CACHE_DIR / f"{XPI_ID}.xpi"
-
-
-def xpi_ok() -> bool:
-    try:
-        with zipfile.ZipFile(xpi_path()) as z:
-            return "META-INF/mozilla.rsa" in z.namelist()
-    except (OSError, zipfile.BadZipFile):
-        return False
-
-
 def extension_in_profile() -> bool:
-    ini = MOZ_PROFILE / "profiles.ini"
-    if not ini.exists():
-        return False
     for ext_json in MOZ_PROFILE.glob("*/extensions.json"):
         try:
             for addon in json.loads(ext_json.read_text()).get("addons", []):
@@ -677,33 +662,32 @@ def extension_in_profile() -> bool:
     return False
 
 
-def open_xpi() -> None:
-    firefox = "/usr/lib/firefox/firefox"
-    run(["curl", "-fsSL", "-o", str(xpi_path()), XPI_URL]) if not xpi_ok() else None
-    say("  Firefox will ask to add the extension: approve it and allow access to all sites.")
-    if DRY_RUN:
-        run([firefox, str(xpi_path())])
-        return
-    subprocess.Popen([firefox, str(xpi_path())], start_new_session=True)
-    for _ in range(45):
-        time.sleep(2)
-        if extension_in_profile():
-            return
-    say("  (not confirmed yet: approve the prompt in Firefox, then re-run to verify)")
+def policy_data() -> dict:
+    try:
+        return json.loads(FIREFOX_POLICIES.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def policy_ok() -> bool:
+    entry = policy_data().get("policies", {}).get("ExtensionSettings", {}).get(XPI_ID, {})
+    return entry.get("installation_mode") == "normal_installed" and entry.get("install_url") == XPI_URL
+
+
+def install_policy() -> None:
+    data = policy_data()
+    data.setdefault("policies", {}).setdefault("ExtensionSettings", {})[XPI_ID] = {
+        "installation_mode": "normal_installed",  # installed for you, but you can still disable/remove it
+        "install_url": XPI_URL,
+    }
+    sudo_write(FIREFOX_POLICIES, json.dumps(data, indent=2) + "\n")
 
 
 def extension_actions() -> list[Action]:
-    def download() -> None:
-        if not DRY_RUN:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        run(["curl", "-fsSL", "-o", str(xpi_path()), XPI_URL])
-
     return [
         Action("native-messaging host linked for Firefox (replaces a manual manifest)", nm_ok, link_nm,
                hint=f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
-        Action("signed extension downloaded", xpi_ok, download),
-        Action("extension active in your Firefox profile", extension_in_profile, open_xpi,
-               hint="Approve the extension prompt in Firefox (Add, allow all sites), then re-run."),
+        Action("Firefox policy installs the signed extension on next start", policy_ok, install_policy),
     ]
 
 
@@ -770,7 +754,9 @@ def cmd_install(_: argparse.Namespace) -> None:
         step()
     say("\nFinal state:")
     cmd_status(argparse.Namespace())
-    say("\nTest: open https://webauthn.io, register/sign in, choose the phone/QR option.")
+    say(f"  extension active in your Firefox profile: {'yes' if extension_in_profile() else 'not yet (restart Firefox)'}")
+    say("\nNext: restart Firefox, open about:addons -> credentialsd-helper -> Permissions and allow all sites,\n"
+        "then test at https://webauthn.io (register/sign in, choose the phone/QR option).")
 
 
 def main() -> None:

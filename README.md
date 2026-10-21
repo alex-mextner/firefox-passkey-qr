@@ -17,7 +17,7 @@ automatically, after a confirmation:
 | 2 | Firefox from `packages.mozilla.org` (+ apt pin), copies your snap profile, optionally removes the snap | the Firefox snap sandbox blocks the native-messaging host the extension needs |
 | 3 | **Only if the PC has no Bluetooth and Home Assistant is reachable:** installs [ha-ble-vhci](https://github.com/alex-mextner/ha-ble-vhci) | the QR flow requires the PC to *hear the phone's BLE advertisement*; ha-ble-vhci gets those from your ESPHome Bluetooth proxy through Home Assistant and presents them to BlueZ as a local adapter |
 | 4 | builds [credentialsd](https://github.com/linux-credentials/credentialsd) + its patched `xdg-desktop-portal` into `/usr/local` | the credential manager that implements hybrid on Linux |
-| 5 | native-messaging link + Mozilla-signed `credentialsd-helper` extension | intercepts `navigator.credentials` in Firefox and shows the phone/USB chooser |
+| 5 | native-messaging link + a Firefox policy (`/etc/firefox/policies/policies.json`, `normal_installed`) that installs the Mozilla-signed `credentialsd-helper` extension on next start (you can still disable it) | intercepts `navigator.credentials` in Firefox and shows the phone/USB chooser |
 
 If the PC has a real Bluetooth adapter, step 3 does nothing. If it has neither
 Bluetooth nor Home Assistant, the installer tells you to get a USB BLE dongle.
@@ -61,5 +61,5 @@ build on Ubuntu 26.04, and an actual phone scan. Report breakage as issues.
 * Bridge: `journalctl --user -u ha-ble-vhci`; `bluetoothctl list`; after being
   added to `plugdev`, log out and in once.
 * After step 4 log out and in once (D-Bus/systemd activation files).
-* Extension: allow it on all sites in `about:addons` -> Permissions.
+* Extension: restart Firefox once; if it does not work, allow all sites in `about:addons` -> credentialsd-helper -> Permissions.
 * Services: `journalctl --user -u xdg-desktop-portal -u xyz.iinuwa.credentialsd.Credentials`.
