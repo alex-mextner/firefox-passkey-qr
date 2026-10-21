@@ -5,7 +5,11 @@ Make **Firefox on Ubuntu** offer **"use your phone (QR code)"** for passkeys
 ([bug 1543674](https://bugzilla.mozilla.org/show_bug.cgi?id=1543674)).
 
 `passkey-qr install` walks through the setup step by step and **asks before
-every step that changes your system**:
+every step that changes your system**. Each action has a check against the real
+system state (files, packages, services, the Firefox profile), so a re-run skips
+what is already done and `passkey-qr status` shows what is left. Missing build
+dependencies (`meson` / `cargo` errors) are identified and installed with apt
+automatically, after a confirmation:
 
 | Step | What | Why |
 |------|------|-----|

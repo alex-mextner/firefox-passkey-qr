@@ -5,8 +5,12 @@ Installs and wires together, step by step and only after you confirm each step:
   * Firefox from Mozilla's apt repo (the snap sandbox blocks native messaging)
   * ha-ble-vhci, if the PC has no Bluetooth but Home Assistant with an ESPHome
     Bluetooth proxy is reachable (hybrid/QR needs the PC to hear the phone's BLE)
-  * credentialsd + patched xdg-desktop-portal (built from source)
+  * credentialsd + patched xdg-desktop-portal (built from source; missing build
+    dependencies are found and installed automatically)
   * the signed credentialsd Firefox extension and its native-messaging host
+
+Every action has a check that looks at the real system state, so re-running
+skips whatever is already applied and `passkey-qr status` shows what is left.
 
 Touch ID is not supported: the Magic Keyboard sensor only works with a Mac's
 Secure Enclave.
@@ -15,9 +19,11 @@ Secure Enclave.
 from __future__ import annotations
 
 import argparse
+import configparser
 import getpass
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -26,29 +32,44 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 HOME = Path.home()
 SRC_DIR = Path(os.environ.get("PASSKEY_QR_SRC", HOME / "dev")).expanduser()
+CACHE_DIR = HOME / ".cache/passkey-qr"
 BRIDGE_REPO = os.environ.get("PASSKEY_QR_BRIDGE_REPO", "https://github.com/alex-mextner/ha-ble-vhci")
 BRIDGE_DIR = HOME / ".local/share/ha-ble-vhci"
 BRIDGE_CFG = HOME / ".config/ha-ble-vhci"
+BRIDGE_VERSION = "0.1.1"
+BRIDGE_UNIT = HOME / ".config/systemd/user/ha-ble-vhci.service"
 CREDSD_REPO = "https://github.com/linux-credentials/credentialsd"
 CREDSD_TAG = "v0.3.1"
 PORTAL_REPO = "https://github.com/linux-credentials/xdg-desktop-portal"
 PORTAL_BRANCH = "credentials-portal"
 XPI_URL = f"{CREDSD_REPO}/releases/download/{CREDSD_TAG}/credentialsd-helper@iinuwa.xyz-0.2.0.xpi"
 XPI_ID = "credentialsd-helper@iinuwa.xyz"
+NM_MANIFEST = "xyz.iinuwa.credentialsd_helper.json"
 SNAP_PROFILE = HOME / "snap/firefox/common/.mozilla/firefox"
 MOZ_PROFILE = HOME / ".mozilla/firefox"
+MOZ_KEY = Path("/etc/apt/keyrings/packages.mozilla.org.asc")
+MOZ_LIST = Path("/etc/apt/sources.list.d/mozilla.list")
+MOZ_PIN = Path("/etc/apt/preferences.d/mozilla")
+UDEV_RULE = Path("/etc/udev/rules.d/99-vhci.rules")
+UDEV_RULE_TEXT = 'KERNEL=="vhci", TAG+="uaccess", GROUP="plugdev", MODE="0660"\n'
+MODULES_CONF = Path("/etc/modules-load.d/hci_vhci.conf")
+PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
+PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
 APT_PACKAGES = [
     # toolchain
     "build-essential", "git", "curl", "rsync", "zip", "meson", "ninja-build", "pkg-config",
     "rustc", "cargo", "gettext", "blueprint-compiler",
-    # credentialsd
+    # credentialsd (udev.pc lives in systemd-dev, not in libudev-dev)
     "libgtk-4-dev", "libadwaita-1-dev", "libdbus-1-dev", "libnfc-dev", "libpcsclite-dev",
-    "libssl-dev", "libudev-dev", "python3-dbus-next",
+    "libssl-dev", "libudev-dev", "systemd-dev", "python3-dbus-next",
     # patched xdg-desktop-portal
     "libdex-dev", "libfuse3-dev", "libgdk-pixbuf-2.0-dev", "libgstreamer-plugins-base1.0-dev",
     "libpipewire-0.3-dev", "libwireplumber-0.5-dev", "libsystemd-dev", "libgudev-1.0-dev",
@@ -57,7 +78,14 @@ APT_PACKAGES = [
     "bluez",
 ]
 
+# pkg-config / program names whose apt package is not found by the obvious name.
+PKG_OVERRIDES = {"udev": "systemd-dev", "systemd": "systemd-dev", "ssl": "libssl-dev"}
+
 DRY_RUN = False
+
+
+class StepError(Exception):
+    pass
 
 
 # --------------------------------------------------------------------------- helpers
@@ -77,21 +105,40 @@ def confirm(question: str) -> bool:
             return False
 
 
-def run(cmd: list[str] | str, *, sudo: bool = False, cwd: Path | None = None,
-        check: bool = True, env: dict | None = None, capture: bool = False) -> subprocess.CompletedProcess:
-    argv = shlex.split(cmd) if isinstance(cmd, str) else list(cmd)
+def _argv(cmd: list[str] | str, sudo: bool) -> list[str]:
+    argv = shlex.split(cmd) if isinstance(cmd, str) else [str(a) for a in cmd]
     if sudo and os.geteuid() != 0:
         argv = ["sudo", *argv]
+    return argv
+
+
+def run(cmd: list[str] | str, *, sudo: bool = False, cwd: Path | None = None,
+        check: bool = True) -> subprocess.CompletedProcess:
+    argv = _argv(cmd, sudo)
     say("  $ " + " ".join(shlex.quote(a) for a in argv))
     if DRY_RUN:
         return subprocess.CompletedProcess(argv, 0, "", "")
-    return subprocess.run(argv, cwd=cwd, check=check, env={**os.environ, **(env or {})},
-                          text=True, capture_output=capture)
+    return subprocess.run(argv, cwd=cwd, check=check, text=True)
 
 
-def out(cmd: list[str]) -> str:
+def run_stream(cmd: list[str] | str, *, cwd: Path | None = None, sudo: bool = False) -> tuple[int, str]:
+    """Run a command, echo its output live and also return it."""
+    argv = _argv(cmd, sudo)
+    say("  $ " + " ".join(shlex.quote(a) for a in argv))
+    if DRY_RUN:
+        return 0, ""
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines: list[str] = []
+    assert proc.stdout
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        lines.append(line)
+    return proc.wait(), "".join(lines)
+
+
+def out(cmd: list[str], timeout: float = 20) -> str:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip()
+        return subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
@@ -105,49 +152,188 @@ def write_file(path: Path, content: str, mode: int = 0o644) -> None:
     path.chmod(mode)
 
 
-def http(url: str, token: str | None = None, timeout: float = 3.0) -> tuple[int, str]:
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"} if token else {})
+def sudo_write(path: Path, content: str) -> None:
+    tmp = CACHE_DIR / "tmp" / path.name
+    if not DRY_RUN:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(content)
+    run(["install", "-D", "-m0644", str(tmp), str(path)], sudo=True)
+
+
+def read_text(path: Path) -> str | None:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read(4096).decode(errors="replace")
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def http(url: str, timeout: float = 3.0) -> int:
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as resp:
+            return resp.status
     except urllib.error.HTTPError as err:
-        return err.code, err.read(4096).decode(errors="replace")
+        return err.code
     except (urllib.error.URLError, OSError):
-        return 0, ""
+        return 0
 
 
-# --------------------------------------------------------------------------- detection
+@dataclass
+class Action:
+    name: str
+    check: Callable[[], bool]
+    apply: Callable[[], None]
+    optional: bool = False  # confirmed separately; skipping it is not a failure
+    hint: str = ""          # shown if the check still fails after apply
+
+
+def show_actions(actions: list[Action]) -> list[Action]:
+    pending = []
+    for action in actions:
+        ok = action.check()
+        say(f"  [{'x' if ok else ' '}] {action.name}")
+        if not ok:
+            pending.append(action)
+    return pending
+
+
+def run_actions(title: str, actions: list[Action], intro: str = "") -> bool:
+    say(f"\n== {title} ==")
+    if intro:
+        say(intro)
+    pending = show_actions(actions)
+    if not pending:
+        say("  nothing to do")
+        return True
+    if not confirm(f"Apply the {len(pending)} unchecked action(s) above?"):
+        say("  skipped")
+        return False
+    for action in pending:
+        if action.check():  # an earlier action may already have fixed it
+            continue
+        if action.optional and not confirm(f"Optional: {action.name}?"):
+            say(f"  skipped: {action.name}")
+            continue
+        say(f"-> {action.name}")
+        action.apply()
+        if not DRY_RUN and not action.check():
+            raise StepError(f"'{action.name}' was applied but the check still fails. {action.hint}".strip())
+    return True
+
+
+# --------------------------------------------------------------------------- packages
+def installed_apt() -> set[str]:
+    status = out(["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n"], timeout=60)
+    return {line.split()[0] for line in status.splitlines() if line.endswith("ii ")}
+
+
+def missing_apt() -> list[str]:
+    have = installed_apt()
+    return [p for p in APT_PACKAGES if p not in have]
+
+
+def apt_install(pkgs: list[str], extra: list[str] | None = None) -> None:
+    run(["apt-get", "install", "-y", *(extra or []), *pkgs], sudo=True)
+
+
+# ----------------------------------------------------- automatic build-dependency fixing
+DEP_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'ERROR: Dependency "([^"]+)" not found'), "pc"),
+    (re.compile(r"Package '?([\w.+-]+)'? was not found in the pkg-config search path"), "pc"),
+    (re.compile(r"The system library `([\w.+-]+)` required by crate"), "pc"),
+    (re.compile(r"ERROR: Program '([^']+)' not found"), "bin"),
+    (re.compile(r"fatal error: ([\w./+-]+\.h): No such file or directory"), "hdr"),
+]
+
+
+def find_missing(text: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    for pattern, kind in DEP_PATTERNS:
+        for name in pattern.findall(text):
+            if (kind, name) not in found:
+                found.append((kind, name))
+    return found
+
+
+def apt_file_search(regex: str) -> list[str]:
+    if not shutil.which("apt-file"):
+        say("  apt-file is needed to find which package provides a missing file")
+        apt_install(["apt-file"])
+    if not any(Path("/var/cache/apt/apt-file").glob("*")):
+        run(["apt-file", "update"], sudo=True)
+    lines = out(["apt-file", "search", "--regexp", regex], timeout=120).splitlines()
+    pkgs = [line.split(":")[0] for line in lines if ":" in line]
+    pkgs = [p for p in pkgs if not p.endswith(("-dbgsym", "-doc"))]
+    return sorted(pkgs, key=lambda p: (not p.endswith("-dev"), len(p)))[:1]
+
+
+def resolve_packages(missing: list[tuple[str, str]]) -> list[str]:
+    pkgs: list[str] = []
+    for kind, name in missing:
+        if name in PKG_OVERRIDES:
+            found = [PKG_OVERRIDES[name]]
+        elif kind == "pc":
+            found = apt_file_search(rf"/pkgconfig/{re.escape(name)}\.pc$")
+        elif kind == "bin":
+            found = [name] if name in ("zip", "cargo", "rustc", "meson", "ninja") else \
+                apt_file_search(rf"^/(usr/)?s?bin/{re.escape(name)}$")
+        else:
+            found = apt_file_search(rf"/usr/include/(.*/)?{re.escape(name)}$")
+        say(f"  missing {kind} '{name}' -> {', '.join(found) or 'no package found'}")
+        pkgs += [p for p in found if p not in pkgs]
+    return pkgs
+
+
+def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
+    """Run a build command; when it fails on a missing dependency, install it and retry."""
+    tried: set[str] = set()
+    for _ in range(rounds):
+        rc, text = run_stream(cmd, cwd=cwd)
+        if rc == 0:
+            return
+        have = installed_apt()
+        pkgs = [p for p in resolve_packages(find_missing(text)) if p not in have]
+        if not pkgs or set(pkgs) <= tried:
+            tail = "\n".join(text.splitlines()[-15:])
+            raise StepError(f"`{' '.join(cmd)}` failed and no installable dependency could be identified:\n{tail}")
+        if not confirm(f"Install the missing build dependencies ({' '.join(pkgs)}) with apt?"):
+            raise StepError("build dependencies not installed")
+        apt_install(pkgs)
+        tried |= set(pkgs)
+    raise StepError(f"`{' '.join(cmd)}` still failing after {rounds} rounds of installing dependencies")
+
+
+# --------------------------------------------------------------------------- bluetooth state
 def bt_adapters() -> list[str]:
     base = Path("/sys/class/bluetooth")
     return sorted(p.name for p in base.glob("hci*")) if base.exists() else []
 
 
+def is_virtual(adapter: str) -> bool:
+    return "/virtual/" in str((Path("/sys/class/bluetooth") / adapter).resolve())
+
+
 def virtual_adapter() -> str | None:
-    for name in bt_adapters():
-        if "/virtual/" in str((Path("/sys/class/bluetooth") / name).resolve()):
-            return name
-    return None
+    return next((a for a in bt_adapters() if is_virtual(a)), None)
 
 
-def firefox_is_deb() -> bool:
-    return Path("/usr/lib/firefox/firefox").exists() and not out(["snap", "list", "firefox"]).startswith("Name")
+def real_adapters() -> list[str]:
+    return [a for a in bt_adapters() if not is_virtual(a)]
 
 
-def firefox_running() -> bool:
-    return bool(out(["pgrep", "-x", "firefox"]) or out(["pgrep", "-f", "/snap/firefox"]))
+def service_active(unit: str, user: bool = False) -> bool:
+    return out(["systemctl", *(["--user"] if user else []), "is-active", unit]) == "active"
 
 
-def missing_apt() -> list[str]:
-    status = out(["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *APT_PACKAGES])
-    installed = {line.split()[0] for line in status.splitlines() if line.endswith("ii ")}
-    return [p for p in APT_PACKAGES if p not in installed]
+def ha_url_configured() -> str | None:
+    text = read_text(BRIDGE_CFG / "env") or ""
+    match = re.search(r"^HA_URL=(\S+)", text, re.M)
+    return match.group(1) if match else None
 
 
 def ha_candidates() -> list[str]:
-    hosts: list[str] = []
     if os.environ.get("HA_URL"):
         return [os.environ["HA_URL"].rstrip("/")]
-    hosts.append("homeassistant.local")
+    hosts = ["homeassistant.local"]
     ts = out(["tailscale", "status", "--json"])
     if ts:
         try:
@@ -160,245 +346,431 @@ def ha_candidates() -> list[str]:
     for host in hosts:
         try:
             with socket.create_connection((host, 8123), timeout=1.5):
-                status, _ = http(f"http://{host}:8123/api/")
-                if status in (200, 401):
+                if http(f"http://{host}:8123/api/") in (200, 401):
                     found.append(f"http://{host}:8123")
         except OSError:
             continue
     return found
 
 
-def service_active(unit: str, user: bool = False) -> bool:
-    cmd = ["systemctl", *(["--user"] if user else []), "is-active", unit]
-    return out(cmd) == "active"
+BRIDGE_BIN = BRIDGE_DIR / "venv/bin/ha-ble-vhci"
 
 
-# --------------------------------------------------------------------------- steps
-def step_apt() -> None:
-    missing = missing_apt()
-    say("\n== 1. Build and runtime packages ==")
-    if not missing:
-        say("  all required packages already installed")
-        return
-    say("  missing: " + " ".join(missing))
-    if confirm("Install these with sudo apt-get?"):
-        run(["apt-get", "install", "-y", *missing], sudo=True)
-    else:
-        say("  skipped (later steps may fail)")
+def bridge_current() -> bool:
+    pip = BRIDGE_DIR / "venv/bin/pip"
+    if not (pip.exists() and BRIDGE_BIN.exists()):
+        return False
+    match = re.search(r"^Version: (\S+)", out([str(pip), "show", "ha-ble-vhci"]), re.M)
+    return bool(match) and match.group(1) == BRIDGE_VERSION
 
 
-def step_firefox() -> None:
-    say("\n== 2. Firefox (non-snap) ==")
-    if firefox_is_deb():
-        say("  Mozilla deb Firefox already installed")
-        return
-    say("  Firefox is the Ubuntu snap (or missing). Its sandbox blocks the native-messaging host\n"
-        "  the extension needs, so it will be replaced by Mozilla's official deb.")
-    if not confirm("Install Mozilla's Firefox deb (adds packages.mozilla.org repo + apt pin)?"):
-        say("  skipped")
-        return
-    if SNAP_PROFILE.exists():
-        while firefox_running() and not DRY_RUN:
-            input("  Close Firefox completely, then press Enter... ")
-        prof = next((p for p in SNAP_PROFILE.iterdir() if p.is_dir() and p.name.endswith(".default")), None)
-        if prof and confirm(f"Copy your profile {prof.name} from the snap to ~/.mozilla/firefox (copy only, snap data kept)?"):
-            run(["rsync", "-a", f"{prof}/", f"{MOZ_PROFILE / prof.name}/"])
-            if not (MOZ_PROFILE / "profiles.ini").exists():
-                run(["cp", str(SNAP_PROFILE / "profiles.ini"), str(MOZ_PROFILE / "profiles.ini")])
-            for lock in ("lock", ".parentlock"):
-                (MOZ_PROFILE / prof.name / lock).unlink(missing_ok=True) if not DRY_RUN else None
-    key = "/etc/apt/keyrings/packages.mozilla.org.asc"
-    run(["install", "-d", "-m0755", "/etc/apt/keyrings"], sudo=True)
-    run(["curl", "-fsSL", "https://packages.mozilla.org/apt/repo-signing-key.gpg", "-o", key], sudo=True)
-    sh = (f"echo 'deb [signed-by={key}] https://packages.mozilla.org/apt mozilla main' > /etc/apt/sources.list.d/mozilla.list && "
-          "printf 'Package: *\\nPin: origin packages.mozilla.org\\nPin-Priority: 1000\\n' > /etc/apt/preferences.d/mozilla")
-    run(["sh", "-c", sh], sudo=True)
-    run(["apt-get", "update"], sudo=True)
-    run(["apt-get", "install", "-y", "--allow-downgrades", "firefox"], sudo=True)  # Ubuntu's transitional package has epoch 1:, so Mozilla's deb counts as a downgrade
-    if not DRY_RUN and not Path("/usr/lib/firefox/firefox").exists():
-        sys.exit("  deb Firefox did not install; snap left untouched")
-    if out(["snap", "list", "firefox"]).startswith("Name") and confirm(
-            "Remove the Firefox snap now? (snapd keeps an automatic snapshot of its data)"):
-        run(["snap", "remove", "firefox"], sudo=True)
-    # remove the stale tarball symlink from earlier manual attempts
-    link = HOME / ".local/bin/firefox"
-    if link.is_symlink() and "/opt/firefox" in os.readlink(link) and not DRY_RUN:
-        link.unlink()
+def ha_valid() -> bool:
+    url = ha_url_configured()
+    token = BRIDGE_CFG / "token"
+    if not (BRIDGE_BIN.exists() and url and token.exists()):
+        return False
+    try:
+        return subprocess.run([str(BRIDGE_BIN), "--check", "--url", url, "--token-file", str(token)],
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
-def ha_setup_token(url: str) -> str | None:
-    token_file = BRIDGE_CFG / "token"
-    if token_file.exists() and not DRY_RUN:
-        say(f"  using existing token in {token_file}")
-        return token_file.read_text().strip()
-    say(f"  Create a long-lived token (admin user): {url}/profile/security -> Long-lived access tokens")
-    if DRY_RUN:
-        return "dry-run-token"
-    token = getpass.getpass("  Paste the token (input hidden, Enter to cancel): ").strip()
-    return token or None
+def bridge_unit_text() -> str:
+    return (
+        "[Unit]\nDescription=Home Assistant Bluetooth proxies as a local scan-only hciN\n"
+        "After=network-online.target\nWants=network-online.target\n\n"
+        f"[Service]\nEnvironmentFile=-{BRIDGE_CFG}/env\nExecStart={BRIDGE_BIN}\n"
+        "Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+    )
 
 
-def step_bluetooth() -> None:
-    say("\n== 3. Bluetooth for the QR (hybrid) flow ==")
-    if virtual_adapter():
-        say(f"  virtual adapter {virtual_adapter()} from ha-ble-vhci is present")
-        return
-    if bt_adapters():
-        say("  local adapter(s) found: " + ", ".join(bt_adapters()) + " - nothing to do")
-        return
-    say("  No Bluetooth adapter. The QR flow needs the PC to hear the phone's BLE advert.")
-    say("  Looking for Home Assistant (ESPHome Bluetooth proxy) on LAN / Tailscale ...")
-    urls = ha_candidates()
-    if urls:
-        say("  found: " + ", ".join(urls))
-    url = None
-    if urls and confirm(f"Use Home Assistant at {urls[0]}?"):
-        url = urls[0]
-    elif not DRY_RUN:
-        typed = input("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to skip: ").strip()
-        url = typed.rstrip("/") or None
-    if not url:
-        say("  No Home Assistant: plug in a USB Bluetooth (BLE) dongle and re-run, or the QR option will not work.")
-        return
-    token = ha_setup_token(url)
-    if not token:
-        say("  skipped")
-        return
-    say(f"  Plan: install ha-ble-vhci from {BRIDGE_REPO}, set up /dev/vhci access (sudo), "
-        "enable bluetooth.service, run it as a systemd user service.")
-    if not confirm("Install and enable the Home Assistant -> virtual Bluetooth bridge?"):
-        say("  skipped")
-        return
+def install_bridge() -> None:
     venv = BRIDGE_DIR / "venv"
     run([sys.executable, "-m", "venv", "--without-pip", str(venv)])
     if not DRY_RUN and not (venv / "bin/pip").exists():
-        run(f"curl -fsSL https://bootstrap.pypa.io/get-pip.py -o {venv}/get-pip.py")
-        run([str(venv / "bin/python"), f"{venv}/get-pip.py", "-q"])
+        getpip = CACHE_DIR / "get-pip.py"
+        getpip.parent.mkdir(parents=True, exist_ok=True)
+        run(["curl", "-fsSL", "https://bootstrap.pypa.io/get-pip.py", "-o", str(getpip)])
+        run([str(venv / "bin/python"), str(getpip), "-q"])
     run([str(venv / "bin/pip"), "install", "-q", "--upgrade", f"git+{BRIDGE_REPO}"])
+    if service_active("ha-ble-vhci", user=True):
+        run(["systemctl", "--user", "restart", "ha-ble-vhci"])  # pick up the new version
+
+
+def configure_ha() -> None:
+    url = ha_url_configured()
+    if not url:
+        say("  Looking for Home Assistant (ESPHome Bluetooth proxy) on LAN / Tailscale ...")
+        found = ha_candidates()
+        if found:
+            say("  found: " + ", ".join(found))
+        if found and confirm(f"Use Home Assistant at {found[0]}?"):
+            url = found[0]
+        elif not DRY_RUN:
+            url = input("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to abort: ").strip().rstrip("/")
+        if not url:
+            raise StepError("No Home Assistant configured: plug in a USB Bluetooth (BLE) dongle instead.")
+    elif (BRIDGE_CFG / "token").exists():
+        say(f"  the stored token for {url} was rejected; enter a new one")
+    say(f"  Create a long-lived token of an admin user: {url}/profile/security -> Long-lived access tokens")
+    token = "dry-run-token" if DRY_RUN else getpass.getpass("  Paste the token (hidden, Enter to abort): ").strip()
+    if not token:
+        raise StepError("no token given")
     write_file(BRIDGE_CFG / "token", token + "\n", 0o600)
     write_file(BRIDGE_CFG / "env", f"HA_URL={url}\n", 0o600)
-    run([str(venv / "bin/ha-ble-vhci"), "--check", "--url", url])
-    user = getpass.getuser()
-    rules = f'KERNEL=="vhci", GROUP="plugdev", MODE="0660"\n'
-    if user not in out(["getent", "group", "plugdev"]):
-        run(["usermod", "-aG", "plugdev", user], sudo=True)
-        say("  added you to plugdev: log out and in once for /dev/vhci access")
-    run(["sh", "-c", f"printf '%s' '{rules}' > /etc/udev/rules.d/99-vhci.rules && echo hci_vhci > /etc/modules-load.d/hci_vhci.conf"], sudo=True)
-    run(["modprobe", "hci_vhci"], sudo=True)
-    run(["udevadm", "control", "--reload"], sudo=True)
-    run(["udevadm", "trigger"], sudo=True)
-    run(["systemctl", "enable", "--now", "bluetooth"], sudo=True)
-    unit = (
-        "[Unit]\nDescription=Home Assistant Bluetooth proxies as a local scan-only hciN\n"
-        "After=network-online.target bluetooth.service\nWants=network-online.target\n\n"
-        f"[Service]\nEnvironmentFile=-{BRIDGE_CFG}/env\nExecStart={venv}/bin/ha-ble-vhci\n"
-        "Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
-    )
-    write_file(HOME / ".config/systemd/user/ha-ble-vhci.service", unit)
-    run(["systemctl", "--user", "daemon-reload"])
-    run(["systemctl", "--user", "enable", "--now", "ha-ble-vhci"])
-    if DRY_RUN:
-        return
-    for _ in range(20):
-        if virtual_adapter():
-            break
-        time.sleep(1)
-    adapter = virtual_adapter()
-    if adapter:
-        run(["bluetoothctl", "power", "on"], check=False)
-        say(f"  OK: {adapter} registered")
-    else:
-        say("  adapter did not appear: if you were just added to plugdev, log out/in, then "
-            "`systemctl --user restart ha-ble-vhci`; logs: journalctl --user -u ha-ble-vhci")
 
 
-def clone(repo: str, dest: Path, ref: str, recurse: bool = False) -> None:
-    if dest.exists():
-        run(["git", "-C", str(dest), "fetch", "--tags", "origin"])
-    else:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", *(["--recurse-submodules"] if recurse else []), repo, str(dest)])
-    run(["git", "-C", str(dest), "checkout", ref])
-    if recurse:
-        run(["git", "-C", str(dest), "submodule", "update", "--init", "--recursive"])
+def adapter_appears() -> None:
+    for attempt in range(2):
+        for _ in range(15):
+            if virtual_adapter():
+                return
+            time.sleep(1)
+        if attempt == 0:
+            run(["systemctl", "--user", "restart", "ha-ble-vhci"])
+    tail = out(["journalctl", "--user", "-u", "ha-ble-vhci", "-n", "15", "--no-pager"])
+    raise StepError("the virtual adapter did not appear. Service log:\n" + tail)
 
 
-def step_credentialsd() -> None:
-    say("\n== 4. credentialsd + patched xdg-desktop-portal ==")
-    if Path("/usr/local/bin/credentialsd").exists() or Path("/usr/local/libexec/credentialsd").exists() \
-            or shutil.which("credentialsd"):
-        say("  credentialsd already installed")
-        return
-    say("  Builds credentialsd (Rust, meson) and the credentials-portal fork of xdg-desktop-portal\n"
-        "  into /usr/local (takes a while, installs with sudo).")
-    if not confirm("Build and install them?"):
-        say("  skipped")
-        return
-    creds = SRC_DIR / "credentialsd"
-    clone(CREDSD_REPO, creds, CREDSD_TAG)
-    run(["meson", "setup", "-Dprefix=/usr/local", "build-release", "--reconfigure"], cwd=creds)
-    run(["meson", "compile", "-C", "build-release"], cwd=creds)
-    run(["meson", "install", "-C", "build-release"], cwd=creds, sudo=True)
-    portal = SRC_DIR / "xdg-desktop-portal"
-    clone(PORTAL_REPO, portal, PORTAL_BRANCH, recurse=True)
-    run(["meson", "setup", "--prefix", "/usr/local", "_build", "--reconfigure"], cwd=portal)
-    run(["meson", "compile", "-C", "_build"], cwd=portal)
-    run(["meson", "install", "-C", "_build"], cwd=portal, sudo=True)
-    dropin = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
-    write_file(dropin, "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n")
-    run(["systemctl", "--user", "daemon-reload"])
-    say("  NOTE: log out and back in once so the new D-Bus activation files are picked up.")
-
-
-def step_extension() -> None:
-    say("\n== 5. Firefox extension + native-messaging host ==")
-    nm_dir = HOME / ".mozilla/native-messaging-hosts"
-    manifest = "xyz.iinuwa.credentialsd_helper.json"
-    libdir = Path("/usr/local/lib64") if (Path("/usr/local/lib64").is_dir() and not Path("/usr/local/lib64").is_symlink()) else Path("/usr/local/lib")
-    src = libdir / "mozilla/native-messaging-hosts" / manifest
-    say(f"  link {nm_dir / manifest} -> {src} (Firefox does not read /usr/local)")
-    if confirm("Create the native-messaging link (replaces a previous manual manifest, if any)?"):
-        if not DRY_RUN:
-            nm_dir.mkdir(parents=True, exist_ok=True)
-            (nm_dir / manifest).unlink(missing_ok=True)
-        run(["ln", "-s", str(src), str(nm_dir / manifest)])
-    xpi = HOME / ".cache/passkey-qr" / f"{XPI_ID}.xpi"
-    say(f"  extension: Mozilla-signed {XPI_URL.rsplit('/', 1)[-1]} from the credentialsd release {CREDSD_TAG}")
-    if confirm("Download it and open it in Firefox (Firefox will ask you to approve; allow access to all sites)?"):
-        xpi.parent.mkdir(parents=True, exist_ok=True) if not DRY_RUN else None
-        run(["curl", "-fsSL", "-o", str(xpi), XPI_URL])
-        run(["/usr/lib/firefox/firefox", str(xpi)], check=False) if DRY_RUN else subprocess.Popen(
-            ["/usr/lib/firefox/firefox", str(xpi)], start_new_session=True)
-
-
-# --------------------------------------------------------------------------- status
-def cmd_status(_: argparse.Namespace) -> None:
-    rows = [
-        ("Firefox (Mozilla deb)", firefox_is_deb()),
-        ("Bluetooth adapter", bool(bt_adapters())),
-        ("  virtual (ha-ble-vhci)", virtual_adapter() is not None),
-        ("ha-ble-vhci service", service_active("ha-ble-vhci", user=True)),
-        ("bluetooth.service", service_active("bluetooth")),
-        ("credentialsd installed", bool(shutil.which("credentialsd")) or Path("/usr/local/bin/credentialsd").exists()
-         or Path("/usr/local/libexec/credentialsd").exists()),
-        ("native-messaging manifest", (HOME / ".mozilla/native-messaging-hosts/xyz.iinuwa.credentialsd_helper.json").exists()),
-        ("missing apt packages", not missing_apt()),
+def bluetooth_actions() -> list[Action]:
+    return [
+        Action(f"ha-ble-vhci {BRIDGE_VERSION} installed", bridge_current, install_bridge),
+        Action("Home Assistant URL + token stored", lambda: bool(ha_url_configured()) and (BRIDGE_CFG / "token").exists(), configure_ha),
+        Action("Home Assistant reachable, token valid and admin", ha_valid, configure_ha,
+               hint="Check the URL/token (the token must belong to an admin user)."),
+        Action("udev rule + hci_vhci autoload",
+               lambda: read_text(UDEV_RULE) == UDEV_RULE_TEXT and (read_text(MODULES_CONF) or "").strip() == "hci_vhci",
+               lambda: (sudo_write(UDEV_RULE, UDEV_RULE_TEXT), sudo_write(MODULES_CONF, "hci_vhci\n"))),
+        Action("/dev/vhci exists (hci_vhci loaded)", lambda: Path("/dev/vhci").exists(),
+               lambda: run(["modprobe", "hci_vhci"], sudo=True)),
+        Action("/dev/vhci usable by you", lambda: os.access("/dev/vhci", os.R_OK | os.W_OK),
+               lambda: (run(["udevadm", "control", "--reload"], sudo=True), run(["udevadm", "trigger"], sudo=True)),
+               hint="Log out and back in once (so the new device ACL / plugdev membership applies), then re-run."),
+        Action("bluetooth.service running", lambda: service_active("bluetooth"),
+               lambda: run(["systemctl", "enable", "--now", "bluetooth"], sudo=True)),
+        Action("ha-ble-vhci user service running",
+               lambda: BRIDGE_UNIT.exists() and service_active("ha-ble-vhci", user=True)
+               and out(["systemctl", "--user", "is-enabled", "ha-ble-vhci"]) == "enabled",
+               lambda: (write_file(BRIDGE_UNIT, bridge_unit_text()),
+                        run(["systemctl", "--user", "daemon-reload"]),
+                        run(["systemctl", "--user", "enable", "ha-ble-vhci"]),
+                        run(["systemctl", "--user", "restart", "ha-ble-vhci"]))),
+        Action("virtual Bluetooth adapter registered", lambda: virtual_adapter() is not None,
+               adapter_appears),
+        Action("adapter powered on", lambda: "Powered: yes" in out(["bluetoothctl", "show"]),
+               lambda: run(["bluetoothctl", "power", "on"], check=False)),
     ]
-    for label, ok in rows:
-        say(f"  [{'x' if ok else ' '}] {label}")
-    if missing_apt():
-        say("      missing: " + " ".join(missing_apt()))
+
+
+# --------------------------------------------------------------------------- firefox
+def deb_firefox_installed() -> bool:
+    version = out(["dpkg-query", "-W", "-f=${Version}", "firefox"])
+    return Path("/usr/lib/firefox/firefox").exists() and bool(version) and "snap" not in version
+
+
+def snap_firefox_present() -> bool:
+    return Path("/snap/firefox/current").exists()
+
+
+def firefox_running() -> bool:
+    return bool(out(["pgrep", "-x", "firefox"]) or out(["pgrep", "-f", "/snap/firefox/"]))
+
+
+def mozilla_repo_ok() -> bool:
+    return (MOZ_KEY.exists() and MOZ_LIST.exists() and MOZ_PIN.exists()
+            and "packages.mozilla.org" in out(["apt-cache", "policy", "firefox"], timeout=60))
+
+
+def snap_profile() -> Path | None:
+    ini = SNAP_PROFILE / "profiles.ini"
+    if not ini.exists():
+        return None
+    cp = configparser.ConfigParser()
+    cp.read(ini)
+    paths = [(s.get("Path"), s.get("Default") == "1") for n, s in cp.items() if n.startswith("Profile") and s.get("Path")]
+    paths.sort(key=lambda t: not t[1])
+    for rel, _ in paths:
+        if (SNAP_PROFILE / rel).is_dir():
+            return SNAP_PROFILE / rel
+    return None
+
+
+def profile_copied() -> bool:
+    prof = snap_profile()
+    return prof is None or (MOZ_PROFILE / prof.name / "prefs.js").exists()
+
+
+def install_mozilla_repo() -> None:
+    run(["install", "-d", "-m0755", "/etc/apt/keyrings"], sudo=True)
+    run(["curl", "-fsSL", "https://packages.mozilla.org/apt/repo-signing-key.gpg", "-o", str(MOZ_KEY)], sudo=True)
+    sudo_write(MOZ_LIST, f"deb [signed-by={MOZ_KEY}] https://packages.mozilla.org/apt mozilla main\n")
+    sudo_write(MOZ_PIN, "Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n")
+    run(["apt-get", "update"], sudo=True)
+
+
+def copy_profile() -> None:
+    prof = snap_profile()
+    assert prof
+    while firefox_running() and not DRY_RUN:
+        input("  Close Firefox completely, then press Enter... ")
+    run(["rsync", "-a", f"{prof}/", f"{MOZ_PROFILE / prof.name}/"])
+    if not (MOZ_PROFILE / "profiles.ini").exists():
+        run(["cp", str(SNAP_PROFILE / "profiles.ini"), str(MOZ_PROFILE / "profiles.ini")])
+    if not DRY_RUN:
+        for lock in ("lock", ".parentlock"):
+            (MOZ_PROFILE / prof.name / lock).unlink(missing_ok=True)
+
+
+def firefox_actions() -> list[Action]:
+    return [
+        Action("Mozilla apt repo + pin (so apt does not bring the snap back)", mozilla_repo_ok, install_mozilla_repo),
+        Action("Firefox deb installed",
+               deb_firefox_installed,
+               # Ubuntu's transitional package has epoch 1:, so Mozilla's deb counts as a downgrade
+               lambda: apt_install(["firefox"], extra=["--allow-downgrades"])),
+        Action("snap profile copied to ~/.mozilla/firefox", profile_copied, copy_profile),
+        Action("Firefox snap removed (snapd keeps an automatic snapshot)", lambda: not snap_firefox_present(),
+               lambda: run(["snap", "remove", "firefox"], sudo=True), optional=True),
+    ]
+
+
+# --------------------------------------------------------------------------- credentialsd + portal
+@dataclass
+class Project:
+    name: str
+    repo: str
+    ref: str
+    is_tag: bool
+    recurse: bool
+    setup: list[str]
+    build_dir: str
+
+    @property
+    def path(self) -> Path:
+        return SRC_DIR / self.name
+
+    @property
+    def build(self) -> Path:
+        return self.path / self.build_dir
+
+
+PROJECTS = [
+    Project("credentialsd", CREDSD_REPO, CREDSD_TAG, True, False, ["-Dprefix=/usr/local"], "build-release"),
+    Project("xdg-desktop-portal", PORTAL_REPO, PORTAL_BRANCH, False, True, ["--prefix", "/usr/local"], "_build"),
+]
+
+
+def git_out(path: Path, *args: str) -> str:
+    return out(["git", "-C", str(path), *args])
+
+
+def source_ready(p: Project) -> bool:
+    if not (p.path / ".git").exists():
+        return False
+    at_ref = (git_out(p.path, "describe", "--tags", "--exact-match") == p.ref if p.is_tag
+              else git_out(p.path, "rev-parse", "--abbrev-ref", "HEAD") == p.ref)
+    subs = git_out(p.path, "submodule", "status", "--recursive").splitlines() if p.recurse else []
+    return at_ref and not any(line[:1] in "-+U" for line in subs)
+
+
+def fetch_source(p: Project) -> None:
+    if (p.path / ".git").exists():
+        run(["git", "-C", str(p.path), "fetch", "--tags", "origin"])
+    else:
+        p.path.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", *(["--recurse-submodules"] if p.recurse else []), p.repo, str(p.path)])
+    run(["git", "-C", str(p.path), "checkout", p.ref])
+    if p.recurse:
+        run(["git", "-C", str(p.path), "submodule", "update", "--init", "--recursive"])
+
+
+def installed_map(p: Project) -> dict[str, str]:
+    if not (p.build / "meson-private").exists():
+        return {}
+    try:
+        return json.loads(out(["meson", "introspect", "--installed", str(p.build)], timeout=60))
+    except json.JSONDecodeError:
+        return {}
+
+
+def is_installed(p: Project) -> bool:
+    files = installed_map(p)
+    return bool(files) and all(os.path.lexists(dest) for dest in files.values())
+
+
+def is_built(p: Project) -> bool:
+    if is_installed(p):
+        return True
+    files = installed_map(p)
+    return bool(files) and all(os.path.lexists(src) for src in files if src.startswith(str(p.build)))
+
+
+def build_project(p: Project) -> None:
+    run_resolving(["meson", "setup", *p.setup, p.build_dir, "--reconfigure"], p.path)
+    run_resolving(["meson", "compile", "-C", p.build_dir], p.path)
+
+
+def credentialsd_actions() -> list[Action]:
+    actions: list[Action] = []
+    for p in PROJECTS:
+        actions += [
+            Action(f"{p.name}: source at {p.ref}" + (" with submodules" if p.recurse else ""),
+                   lambda p=p: source_ready(p), lambda p=p: fetch_source(p)),
+            Action(f"{p.name}: built (missing build dependencies are installed automatically)",
+                   lambda p=p: is_built(p), lambda p=p: build_project(p)),
+            Action(f"{p.name}: installed into /usr/local", lambda p=p: is_installed(p),
+                   lambda p=p: run(["meson", "install", "-C", p.build_dir], cwd=p.path, sudo=True)),
+        ]
+    actions.append(Action("xdg-desktop-portal: credential portal enabled (systemd user drop-in)",
+                          lambda: read_text(PORTAL_DROPIN) == PORTAL_DROPIN_TEXT,
+                          lambda: (write_file(PORTAL_DROPIN, PORTAL_DROPIN_TEXT),
+                                   run(["systemctl", "--user", "daemon-reload"]))))
+    return actions
+
+
+# --------------------------------------------------------------------------- extension
+def nm_link() -> Path:
+    return HOME / ".mozilla/native-messaging-hosts" / NM_MANIFEST
+
+
+def nm_target() -> Path:
+    lib64 = Path("/usr/local/lib64")
+    libdir = lib64 if lib64.is_dir() and not lib64.is_symlink() else Path("/usr/local/lib")
+    return libdir / "mozilla/native-messaging-hosts" / NM_MANIFEST
+
+
+def nm_ok() -> bool:
+    link = nm_link()
+    return link.is_symlink() and link.exists()
+
+
+def link_nm() -> None:
+    if not DRY_RUN:
+        nm_link().parent.mkdir(parents=True, exist_ok=True)
+    run(["ln", "-sfn", str(nm_target()), str(nm_link())])
+
+
+def xpi_path() -> Path:
+    return CACHE_DIR / f"{XPI_ID}.xpi"
+
+
+def xpi_ok() -> bool:
+    try:
+        with zipfile.ZipFile(xpi_path()) as z:
+            return "META-INF/mozilla.rsa" in z.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def extension_in_profile() -> bool:
+    ini = MOZ_PROFILE / "profiles.ini"
+    if not ini.exists():
+        return False
+    for ext_json in MOZ_PROFILE.glob("*/extensions.json"):
+        try:
+            for addon in json.loads(ext_json.read_text()).get("addons", []):
+                if addon.get("id") == XPI_ID and addon.get("active"):
+                    return True
+        except (OSError, json.JSONDecodeError):
+            continue
+    return False
+
+
+def open_xpi() -> None:
+    firefox = "/usr/lib/firefox/firefox"
+    run(["curl", "-fsSL", "-o", str(xpi_path()), XPI_URL]) if not xpi_ok() else None
+    say("  Firefox will ask to add the extension: approve it and allow access to all sites.")
+    if DRY_RUN:
+        run([firefox, str(xpi_path())])
+        return
+    subprocess.Popen([firefox, str(xpi_path())], start_new_session=True)
+    for _ in range(45):
+        time.sleep(2)
+        if extension_in_profile():
+            return
+    say("  (not confirmed yet: approve the prompt in Firefox, then re-run to verify)")
+
+
+def extension_actions() -> list[Action]:
+    def download() -> None:
+        if not DRY_RUN:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        run(["curl", "-fsSL", "-o", str(xpi_path()), XPI_URL])
+
+    return [
+        Action("native-messaging host linked for Firefox (replaces a manual manifest)", nm_ok, link_nm,
+               hint=f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
+        Action("signed extension downloaded", xpi_ok, download),
+        Action("extension active in your Firefox profile", extension_in_profile, open_xpi,
+               hint="Approve the extension prompt in Firefox (Add, allow all sites), then re-run."),
+    ]
+
+
+# --------------------------------------------------------------------------- steps
+def step_packages() -> bool:
+    def install_missing() -> None:
+        apt_install(missing_apt())
+
+    return run_actions("1. Build and runtime packages",
+                       [Action("all required apt packages installed", lambda: not missing_apt(), install_missing)])
+
+
+def step_firefox() -> bool:
+    return run_actions("2. Firefox (non-snap)", firefox_actions(),
+                       "  The snap sandbox blocks the native-messaging host the extension needs.")
+
+
+def step_bluetooth() -> bool:
+    if real_adapters():
+        say("\n== 3. Bluetooth for the QR (hybrid) flow ==")
+        say("  local adapter(s) present: " + ", ".join(real_adapters()) + " - nothing to do")
+        return True
+    return run_actions(
+        "3. Bluetooth for the QR (hybrid) flow", bluetooth_actions(),
+        "  No physical Bluetooth adapter. The QR flow needs the PC to hear the phone's BLE advert;\n"
+        "  ha-ble-vhci provides that from a Home Assistant Bluetooth proxy.")
+
+
+def step_credentialsd() -> bool:
+    return run_actions("4. credentialsd + patched xdg-desktop-portal", credentialsd_actions(),
+                       "  Built from source into /usr/local; this takes a while.")
+
+
+def step_extension() -> bool:
+    return run_actions("5. Firefox extension + native-messaging host", extension_actions())
+
+
+STEPS = [step_packages, step_firefox, step_bluetooth, step_credentialsd, step_extension]
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    groups = [
+        ("1. Packages", [Action("all required apt packages installed", lambda: not missing_apt(), lambda: None)]),
+        ("2. Firefox", firefox_actions()),
+        ("4. credentialsd + portal", credentialsd_actions()),
+        ("5. Extension", extension_actions()),
+    ]
+    if real_adapters():
+        say("== 3. Bluetooth ==\n  local adapter(s): " + ", ".join(real_adapters()))
+    else:
+        groups.insert(2, ("3. Bluetooth via Home Assistant", bluetooth_actions()))
+    for title, actions in groups:
+        say(f"\n== {title} ==")
+        show_actions(actions)
+    missing = missing_apt()
+    if missing:
+        say("\n  missing packages: " + " ".join(missing))
 
 
 def cmd_install(_: argparse.Namespace) -> None:
-    say("passkey-qr will change your system step by step; every step asks first.")
-    step_apt()
-    step_firefox()
-    step_bluetooth()
-    step_credentialsd()
-    step_extension()
-    say("\nDone. Test: open https://webauthn.io, register/sign in, choose the phone/QR option.")
-    say("If it does not show up: `passkey-qr status`, and see the troubleshooting section of the README.")
+    say("passkey-qr changes your system step by step; every step asks first, and anything already\n"
+        "applied (checked against the real system state) is skipped.")
+    for step in STEPS:
+        step()
+    say("\nFinal state:")
+    cmd_status(argparse.Namespace())
+    say("\nTest: open https://webauthn.io, register/sign in, choose the phone/QR option.")
 
 
 def main() -> None:
@@ -406,14 +778,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="passkey-qr", description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="print the commands, change nothing, auto-answer yes")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status").set_defaults(func=cmd_status)
-    sub.add_parser("install").set_defaults(func=cmd_install)
+    sub.add_parser("status", help="show which actions are really applied").set_defaults(func=cmd_status)
+    sub.add_parser("install", help="apply everything that is missing").set_defaults(func=cmd_install)
     args = parser.parse_args()
     DRY_RUN = args.dry_run
     try:
         args.func(args)
+    except StepError as err:
+        sys.exit(f"\nstopped: {err}\nFix the cause and re-run `passkey-qr install`: finished actions are skipped.")
     except subprocess.CalledProcessError as err:
-        sys.exit(f"\nstep failed (exit {err.returncode}): {' '.join(map(str, err.cmd))}")
+        sys.exit(f"\ncommand failed (exit {err.returncode}): {' '.join(map(str, err.cmd))}\n"
+                 "Re-run `passkey-qr install` after fixing it: finished actions are skipped.")
     except (KeyboardInterrupt, EOFError):
         sys.exit("\naborted")
 
