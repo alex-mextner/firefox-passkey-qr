@@ -30,6 +30,21 @@ cd firefox-passkey-qr
 ./passkey-qr status
 ```
 
+### Unattended use
+
+```sh
+./passkey-qr --dry-run --yes install   # the exact steps an unattended run performs
+./passkey-qr --yes install             # answers every step; never prompts
+./passkey-qr check                     # read-only: exit 0 = everything required is in place, 3 = not
+```
+
+`--yes` answers yes to every step and never prompts. What it cannot ask for it does not do, and it stops
+with a message instead of guessing: the Home Assistant token must already be in `$HA_TOKEN` or
+`~/.config/ha-ble-vhci/token` (otherwise the Bluetooth step stops; a stored token that Home Assistant
+rejected is only replaced by a fresh `$HA_TOKEN`; the token is never printed), a running Firefox stops the
+profile-copy action, and the Firefox snap is **kept** unless you also pass `--remove-snap`.
+`PASSKEY_QR_BLUETOOTH_DIR` overrides `/sys/class/bluetooth` (a test seam: `python3 -m unittest discover -s tests`).
+
 `credentialsd` and the patched portal are cloned into `~/dev` (override with
 `PASSKEY_QR_SRC=/some/dir`); an existing checkout is reused and switched to the
 pinned release tag.

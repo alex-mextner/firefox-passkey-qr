@@ -82,6 +82,9 @@ APT_PACKAGES = [
 PKG_OVERRIDES = {"udev": "systemd-dev", "systemd": "systemd-dev", "ssl": "libssl-dev"}
 
 DRY_RUN = False
+ASSUME_YES = False
+REMOVE_SNAP = False
+BLUETOOTH_DIR = Path(os.environ.get("PASSKEY_QR_BLUETOOTH_DIR", "/sys/class/bluetooth"))
 
 
 class StepError(Exception):
@@ -93,7 +96,15 @@ def say(msg: str = "") -> None:
     print(msg, flush=True)
 
 
-def confirm(question: str) -> bool:
+def confirm(question: str, *, destructive: bool = False) -> bool:
+    """Ask before a step. ``--yes`` answers for you and never prompts; a ``destructive`` step
+    (removing the Firefox snap) additionally needs ``--remove-snap`` and is declined without it."""
+    if destructive and ASSUME_YES and not REMOVE_SNAP:
+        say(f"? {question} [no: --yes does not remove the snap without --remove-snap]")
+        return False
+    if ASSUME_YES:
+        say(f"? {question} [yes: --yes]")
+        return True
     if DRY_RUN:
         say(f"? {question} [auto-yes in dry-run]")
         return True
@@ -183,6 +194,7 @@ class Action:
     check: Callable[[], bool]
     apply: Callable[[], None]
     optional: bool = False  # confirmed separately; skipping it is not a failure
+    destructive: bool = False  # with --yes it additionally needs --remove-snap
     hint: str = ""          # shown if the check still fails after apply
 
 
@@ -210,7 +222,7 @@ def run_actions(title: str, actions: list[Action], intro: str = "") -> bool:
     for action in pending:
         if action.check():  # an earlier action may already have fixed it
             continue
-        if action.optional and not confirm(f"Optional: {action.name}?"):
+        if action.optional and not confirm(f"Optional: {action.name}?", destructive=action.destructive):
             say(f"  skipped: {action.name}")
             continue
         say(f"-> {action.name}")
@@ -304,12 +316,11 @@ def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
 
 # --------------------------------------------------------------------------- bluetooth state
 def bt_adapters() -> list[str]:
-    base = Path("/sys/class/bluetooth")
-    return sorted(p.name for p in base.glob("hci*")) if base.exists() else []
+    return sorted(p.name for p in BLUETOOTH_DIR.glob("hci*")) if BLUETOOTH_DIR.exists() else []
 
 
 def is_virtual(adapter: str) -> bool:
-    return "/virtual/" in str((Path("/sys/class/bluetooth") / adapter).resolve())
+    return "/virtual/" in str((BLUETOOTH_DIR / adapter).resolve())
 
 
 def virtual_adapter() -> str | None:
@@ -398,8 +409,14 @@ def install_bridge() -> None:
         run(["systemctl", "--user", "restart", "ha-ble-vhci"])  # pick up the new version
 
 
+def ha_token() -> str | None:
+    """A token that needs no question: ``$HA_TOKEN``, else an existing token file."""
+    return os.environ.get("HA_TOKEN", "").strip() or (read_text(BRIDGE_CFG / "token") or "").strip() or None
+
+
 def configure_ha() -> None:
     url = ha_url_configured()
+    stored = (read_text(BRIDGE_CFG / "token") or "").strip()
     if not url:
         say("  Looking for Home Assistant (ESPHome Bluetooth proxy) on LAN / Tailscale ...")
         found = ha_candidates()
@@ -407,14 +424,26 @@ def configure_ha() -> None:
             say("  found: " + ", ".join(found))
         if found and confirm(f"Use Home Assistant at {found[0]}?"):
             url = found[0]
-        elif not DRY_RUN:
+        elif not DRY_RUN and not ASSUME_YES:
             url = input("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to abort: ").strip().rstrip("/")
         if not url:
             raise StepError("No Home Assistant configured: plug in a USB Bluetooth (BLE) dongle instead.")
-    elif (BRIDGE_CFG / "token").exists():
-        say(f"  the stored token for {url} was rejected; enter a new one")
-    say(f"  Create a long-lived token of an admin user: {url}/profile/security -> Long-lived access tokens")
-    token = "dry-run-token" if DRY_RUN else getpass.getpass("  Paste the token (hidden, Enter to abort): ").strip()
+        rejected = False
+    else:
+        rejected = bool(stored)
+    if ASSUME_YES:
+        token = ha_token()
+        if rejected and token == stored:
+            token = None  # the stored token was just rejected; only a fresh $HA_TOKEN can fix it
+        if not token:
+            raise StepError(f"--yes cannot ask for a token: put a valid one in $HA_TOKEN "
+                            f"(or {BRIDGE_CFG / 'token'}) and re-run")
+        say("  using the token from $HA_TOKEN or the token file; it is never printed")
+    else:
+        if rejected:
+            say(f"  the stored token for {url} was rejected; enter a new one")
+        say(f"  Create a long-lived token of an admin user: {url}/profile/security -> Long-lived access tokens")
+        token = "dry-run-token" if DRY_RUN else getpass.getpass("  Paste the token (hidden, Enter to abort): ").strip()
     if not token:
         raise StepError("no token given")
     write_file(BRIDGE_CFG / "token", token + "\n", 0o600)
@@ -512,6 +541,8 @@ def install_mozilla_repo() -> None:
 def copy_profile() -> None:
     prof = snap_profile()
     assert prof
+    if firefox_running() and ASSUME_YES and not DRY_RUN:
+        raise StepError("Firefox is running and --yes cannot ask you to close it: close it and re-run")
     while firefox_running() and not DRY_RUN:
         input("  Close Firefox completely, then press Enter... ")
     run(["rsync", "-a", f"{prof}/", f"{MOZ_PROFILE / prof.name}/"])
@@ -531,7 +562,7 @@ def firefox_actions() -> list[Action]:
                lambda: apt_install(["firefox"], extra=["--allow-downgrades"])),
         Action("snap profile copied to ~/.mozilla/firefox", profile_copied, copy_profile),
         Action("Firefox snap removed (snapd keeps an automatic snapshot)", lambda: not snap_firefox_present(),
-               lambda: run(["snap", "remove", "firefox"], sudo=True), optional=True),
+               lambda: run(["snap", "remove", "firefox"], sudo=True), optional=True, destructive=True),
     ]
 
 
@@ -692,12 +723,12 @@ def extension_actions() -> list[Action]:
 
 
 # --------------------------------------------------------------------------- steps
-def step_packages() -> bool:
-    def install_missing() -> None:
-        apt_install(missing_apt())
+def packages_actions() -> list[Action]:
+    return [Action("all required apt packages installed", lambda: not missing_apt(), lambda: apt_install(missing_apt()))]
 
-    return run_actions("1. Build and runtime packages",
-                       [Action("all required apt packages installed", lambda: not missing_apt(), install_missing)])
+
+def step_packages() -> bool:
+    return run_actions("1. Build and runtime packages", packages_actions())
 
 
 def step_firefox() -> bool:
@@ -728,18 +759,22 @@ def step_extension() -> bool:
 STEPS = [step_packages, step_firefox, step_bluetooth, step_credentialsd, step_extension]
 
 
-def cmd_status(_: argparse.Namespace) -> None:
-    groups = [
-        ("1. Packages", [Action("all required apt packages installed", lambda: not missing_apt(), lambda: None)]),
+def status_groups() -> list[tuple[str, list[Action]]]:
+    """The step groups with their actions; step 3 has none when a physical adapter is present."""
+    return [
+        ("1. Packages", packages_actions()),
         ("2. Firefox", firefox_actions()),
+        ("3. Bluetooth via Home Assistant", [] if real_adapters() else bluetooth_actions()),
         ("4. credentialsd + portal", credentialsd_actions()),
         ("5. Extension", extension_actions()),
     ]
-    if real_adapters():
-        say("== 3. Bluetooth ==\n  local adapter(s): " + ", ".join(real_adapters()))
-    else:
-        groups.insert(2, ("3. Bluetooth via Home Assistant", bluetooth_actions()))
-    for title, actions in groups:
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    for title, actions in status_groups():
+        if title.startswith("3.") and real_adapters():
+            say("\n== 3. Bluetooth ==\n  local adapter(s): " + ", ".join(real_adapters()))
+            continue
         say(f"\n== {title} ==")
         show_actions(actions)
     missing = missing_apt()
@@ -747,9 +782,30 @@ def cmd_status(_: argparse.Namespace) -> None:
         say("\n  missing packages: " + " ".join(missing))
 
 
+def status_rows() -> list[tuple[str, bool, bool]]:
+    """``(label, ok, required)``: ``required`` rows decide ``check``; the others are context.
+    Bluetooth is one required row (any adapter, local or ha-ble-vhci); how it is provided is context."""
+    rows = [("Bluetooth adapter (local or ha-ble-vhci)", bool(bt_adapters()), True)]
+    for title, actions in status_groups():
+        if title.startswith("3."):
+            rows += [(a.name, a.check(), False) for a in actions]
+        else:
+            rows += [(a.name, a.check(), not a.optional) for a in actions]
+    return rows
+
+
+def cmd_check(_: argparse.Namespace) -> None:
+    """Read-only: exit 0 when every required row holds, 3 (and the unmet rows) otherwise."""
+    unmet = [label for label, ok, required in status_rows() if required and not ok]
+    for label in unmet:
+        say(f"  missing: {label}")
+    sys.exit(3 if unmet else 0)
+
+
 def cmd_install(_: argparse.Namespace) -> None:
-    say("passkey-qr changes your system step by step; every step asks first, and anything already\n"
-        "applied (checked against the real system state) is skipped.")
+    say("passkey-qr changes your system step by step; "
+        + ("--yes answers every step for you" if ASSUME_YES else "every step asks first")
+        + ", and anything already\napplied (checked against the real system state) is skipped.")
     for step in STEPS:
         step()
     say("\nFinal state:")
@@ -760,14 +816,21 @@ def cmd_install(_: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    global DRY_RUN
+    global DRY_RUN, ASSUME_YES, REMOVE_SNAP
     parser = argparse.ArgumentParser(prog="passkey-qr", description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="print the commands, change nothing, auto-answer yes")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="answer yes to every step and never prompt (a token must be in $HA_TOKEN or the "
+                             "token file; the Firefox snap is kept unless --remove-snap)")
+    parser.add_argument("--remove-snap", action="store_true",
+                        help="with --yes, also remove the Firefox snap after the deb is installed")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="show which actions are really applied").set_defaults(func=cmd_status)
+    sub.add_parser("check", help="exit 0 when everything required is in place, 3 otherwise (read-only)"
+                   ).set_defaults(func=cmd_check)
     sub.add_parser("install", help="apply everything that is missing").set_defaults(func=cmd_install)
     args = parser.parse_args()
-    DRY_RUN = args.dry_run
+    DRY_RUN, ASSUME_YES, REMOVE_SNAP = args.dry_run, args.yes, args.remove_snap
     try:
         args.func(args)
     except StepError as err:
