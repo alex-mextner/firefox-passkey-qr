@@ -26,6 +26,10 @@ cd firefox-passkey-qr
 ./passkey-qr status
 ```
 
+`credentialsd` and the patched portal are cloned into `~/dev` (override with
+`PASSKEY_QR_SRC=/some/dir`); an existing checkout is reused and switched to the
+pinned release tag.
+
 For step 3 you need a **long-lived access token of an admin Home Assistant
 user** (Profile -> Security); the installer asks for it and stores it in
 `~/.config/ha-ble-vhci/token` (mode 600).
