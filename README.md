@@ -30,6 +30,46 @@ cd firefox-passkey-qr
 ./passkey-qr status
 ```
 
+The deb Firefox is told, before its first start, to open the profile copied from the snap (its own
+`[Install4F96D1932A9F858E]` section: that hash is Firefox's name for `/usr/lib/firefox`, the same on every
+machine); if it already started and made an empty profile, that profile is kept and the copied one becomes the
+default. If you ran an older version of this installer first, point Firefox at your profile once in
+`about:profiles` ("Set as default profile").
+
+### Unattended use
+
+```sh
+./passkey-qr --dry-run --yes install   # the steps an unattended run performs, assuming the token is provided (exit 0, changes nothing)
+./passkey-qr --yes install             # answers every step; never prompts
+./passkey-qr check                     # read-only: exit 0 = everything required is in place, 3 = not
+```
+
+`--yes` answers yes to every step and **never prompts, never closes or starts your browser and never opens a
+page**. What a person has to do is not guessed: that step is skipped, the other steps still run, and the run
+ends listing it:
+
+| Exit code of `install` | Meaning |
+|---|---|
+| 0 | everything required is in place |
+| 3 | finished what it could; the list at the end says what waits for you (re-run afterwards, finished actions are skipped) |
+| 1 | a step failed (the message and the log name the command) |
+
+What waits for you under `--yes`: the Home Assistant token (it must already be in `$HA_TOKEN` or
+`~/.config/ha-ble-vhci/token`; a stored token that Home Assistant rejected is only replaced by a fresh
+`$HA_TOKEN`; the token is never printed), a Firefox that is still running (it blocks the profile copy and
+the profile switch), and no Bluetooth adapter and no Home Assistant at all (plug in a USB BLE dongle).
+The Firefox snap is **kept** unless you also pass `--remove-snap`. Firefox is not restarted: the policy is
+in place, so it installs the extension at its next start (`check` does not wait for that).
+`HA_URL` selects a Home Assistant by hand instead of the LAN/Tailscale lookup.
+
+`check` also runs on a machine that was never touched (everything unmet, exit 3), changes nothing on disk or
+in any service (the app-id probe only registers a short-lived D-Bus connection with the portal, and it never
+starts the portal) and never writes a log; only `install` writes `~/.local/state/passkey-qr/<timestamp>-install-<pid>.log`.
+[ubuntu-tweaks](https://github.com/alex-mextner/ubuntu-tweaks) drives exactly this interface
+(`--dry-run --yes install` as the preview, `--yes [--remove-snap] install` to apply, `check` for drift)
+from `ubuntu-tweak init`.
+`PASSKEY_QR_BLUETOOTH_DIR` overrides `/sys/class/bluetooth` (a test seam: `python3 -m unittest discover -s tests`).
+
 `credentialsd` and the patched portal are cloned into `~/dev` (override with
 `PASSKEY_QR_SRC=/some/dir`); an existing checkout is reused and switched to the
 pinned release tag.
@@ -41,12 +81,12 @@ user** (Profile -> Security); the installer asks for it and stores it in
 After the last step the installer reloads the user D-Bus/systemd services, restarts
 the portal, restarts Firefox (session restore brings the tabs back), waits until
 the extension is active with access to all sites, and offers to open
-https://webauthn.io. The policy-installed extension gets `<all_urls>` granted
+https://webauthn.io (none of the Firefox restart or the test page happens under `--yes`). The policy-installed extension gets `<all_urls>` granted
 automatically (checked in an isolated Firefox 158 profile).
 
-Everything shown on screen, including all command output, is also written to
-`~/.local/state/passkey-qr/<timestamp>-<command>.log` (`latest.log` links to the
-last install run) together with a diagnostic snapshot at the end or on failure.
+Everything shown on screen during `install`, including all command output, is also written to
+`~/.local/state/passkey-qr/<timestamp>-install.log` (`latest.log` links to the
+last run) together with a diagnostic snapshot at the end or on failure.
 Home Assistant tokens are never logged.
 
 ## Not supported
