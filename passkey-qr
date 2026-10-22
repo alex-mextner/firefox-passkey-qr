@@ -810,6 +810,14 @@ def is_built(p: Project) -> bool:
     return bool(files) and all(os.path.lexists(src) for src in files if src.startswith(str(p.build)))
 
 
+def install_project(p: Project) -> None:
+    """Install what was built. --no-rebuild: otherwise root re-runs the always-stale cargo/ninja
+    targets with root's toolchain and leaves root-owned files in the user's build directory."""
+    run(["meson", "install", "-C", p.build_dir, "--no-rebuild"], cwd=p.path, sudo=True)
+    owner = f"{os.getuid()}:{os.getgid()}"
+    run(["chown", "-R", owner, str(p.build)], sudo=True)  # undo any root-owned leftovers
+
+
 def libdex_gdbus_ready() -> bool:
     return bool(out(["pkg-config", "--variable=gdbus_codegen_extension", "libdex-1"]))
 
@@ -898,7 +906,7 @@ def credentialsd_actions() -> list[Action]:
             Action(f"{p.name}: built (missing build dependencies are installed automatically)",
                    lambda p=p: is_built(p), lambda p=p: build_project(p)),
             Action(f"{p.name}: installed into /usr/local", lambda p=p: is_installed(p),
-                   lambda p=p: run(["meson", "install", "-C", p.build_dir], cwd=p.path, sudo=True)),
+                   lambda p=p: install_project(p)),
         ]
         if p.name == "libdex":
             actions.append(Action("libdex from /usr/local is known to the dynamic linker",
