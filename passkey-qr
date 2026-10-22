@@ -64,6 +64,7 @@ BLUEPRINT_REPO = "https://gitlab.gnome.org/GNOME/blueprint-compiler.git"
 BLUEPRINT_TAG = "v0.20.4"
 BLUEPRINT_MIN = (0, 20, 4)  # credentialsd-ui requires >= 0.20.4, Ubuntu 26.04 ships 0.19
 LOCAL_BIN = HOME / ".local/bin"
+CARGO_BIN = HOME / ".cargo/bin"
 PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
 PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
@@ -75,6 +76,7 @@ APT_PACKAGES = [
     "libgtk-4-dev", "libadwaita-1-dev", "libdbus-1-dev", "libnfc-dev", "libpcsclite-dev",
     "libssl-dev", "libudev-dev", "systemd-dev", "python3-dbus-next",
     "python3-gi", "gir1.2-gtk-4.0", "gir1.2-adw-1",  # needed by blueprint-compiler
+    "libclang-dev", "libxml2-utils",  # bindgen (nfc1-sys) needs clang headers; gresource needs xmllint
     # patched xdg-desktop-portal
     "libdex-dev", "libfuse3-dev", "libgdk-pixbuf-2.0-dev", "libgstreamer-plugins-base1.0-dev",
     "libpipewire-0.3-dev", "libwireplumber-0.5-dev", "libsystemd-dev", "libgudev-1.0-dev",
@@ -84,7 +86,8 @@ APT_PACKAGES = [
 ]
 
 # pkg-config / program names whose apt package is not found by the obvious name.
-PKG_OVERRIDES = {"udev": "systemd-dev", "systemd": "systemd-dev", "ssl": "libssl-dev"}
+PKG_OVERRIDES = {"udev": "systemd-dev", "systemd": "systemd-dev", "ssl": "libssl-dev",
+                 "xmllint": "libxml2-utils", "stdbool.h": "libclang-dev"}
 
 DRY_RUN = False
 
@@ -284,6 +287,8 @@ DEP_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Program ([\w.+-]+) found: NO found [\d.]+ but need"), "tool"),
     (re.compile(r"ERROR: Program '([^']+)' not found"), "bin"),
     (re.compile(r"fatal error: ([\w./+-]+\.h): No such file or directory"), "hdr"),
+    (re.compile(r"fatal error: '([\w./+-]+\.h)' file not found"), "hdr"),
+    (re.compile(r"\b(\w+) is not in PATH"), "bin"),
 ]
 
 
@@ -331,8 +336,11 @@ def version_of(tool: str) -> tuple[int, ...]:
 
 
 def ensure_local_bin_on_path() -> None:
-    if str(LOCAL_BIN) not in os.environ.get("PATH", "").split(":")[:1]:
-        os.environ["PATH"] = f"{LOCAL_BIN}:{os.environ.get('PATH', '')}"
+    parts = os.environ.get("PATH", "").split(":")
+    for directory in (str(CARGO_BIN), str(LOCAL_BIN)):
+        if directory not in parts[:2]:
+            parts = [directory] + [p for p in parts if p != directory]
+    os.environ["PATH"] = ":".join(parts)
 
 
 def blueprint_ok() -> bool:
@@ -796,6 +804,9 @@ def is_built(p: Project) -> bool:
 
 
 def build_project(p: Project) -> None:
+    ensure_local_bin_on_path()
+    if p.name == "credentialsd" and rust_channel():
+        os.environ["RUSTUP_TOOLCHAIN"] = rust_channel()  # overrides rust-toolchain.toml (no extra components)
     run_resolving(["meson", "setup", *p.setup, p.build_dir, "--reconfigure"], p.path)
     run_resolving(["meson", "compile", "-C", p.build_dir], p.path)
 
@@ -825,15 +836,47 @@ def restart_portal() -> None:
             time.sleep(1)
 
 
+def rust_channel() -> str | None:
+    text = read_text(SRC_DIR / "credentialsd" / "rust-toolchain.toml") or ""
+    match = re.search(r'^channel\s*=\s*"([^"]+)"', text, re.M)
+    return match.group(1) if match else None
+
+
+def rust_ok() -> bool:
+    channel = rust_channel()
+    if not channel:
+        return False
+    ensure_local_bin_on_path()
+    return channel in out([str(CARGO_BIN / "rustup"), "run", channel, "cargo", "--version"], timeout=60)
+
+
+def install_rust() -> None:
+    """credentialsd pins a Rust newer than Ubuntu's (its manifest needs TOML 1.1): use rustup in ~/.cargo."""
+    channel = rust_channel()
+    assert channel
+    rustup = CARGO_BIN / "rustup"
+    if not rustup.exists():
+        script = CACHE_DIR / "rustup-init.sh"
+        if not DRY_RUN:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        run(["curl", "--proto", "=https", "--tlsv1.2", "-sSf", "https://sh.rustup.rs", "-o", str(script)])
+        run(["sh", str(script), "-y", "--profile", "minimal", "--default-toolchain", "none", "--no-modify-path"])
+    run([str(rustup), "toolchain", "install", channel, "--profile", "minimal"])
+    ensure_local_bin_on_path()
+
+
 def credentialsd_actions() -> list[Action]:
-    actions: list[Action] = [
-        Action(f"blueprint-compiler >= {'.'.join(map(str, BLUEPRINT_MIN))} (built into ~/.local; Ubuntu ships 0.19)",
-               blueprint_ok, build_blueprint),
-    ]
+    blueprint = Action(f"blueprint-compiler >= {'.'.join(map(str, BLUEPRINT_MIN))} (built into ~/.local; Ubuntu ships 0.19)",
+                       blueprint_ok, build_blueprint)
+    rust = Action("Rust toolchain pinned by credentialsd (via rustup in ~/.cargo; Ubuntu's cargo is too old)",
+                  rust_ok, install_rust)
+    actions: list[Action] = []
     for p in PROJECTS:
+        actions.append(Action(f"{p.name}: source at {p.ref}" + (" with submodules" if p.recurse else ""),
+                              lambda p=p: source_ready(p), lambda p=p: fetch_source(p)))
+        if p.name == "credentialsd":
+            actions += [rust, blueprint]
         actions += [
-            Action(f"{p.name}: source at {p.ref}" + (" with submodules" if p.recurse else ""),
-                   lambda p=p: source_ready(p), lambda p=p: fetch_source(p)),
             Action(f"{p.name}: built (missing build dependencies are installed automatically)",
                    lambda p=p: is_built(p), lambda p=p: build_project(p)),
             Action(f"{p.name}: installed into /usr/local", lambda p=p: is_installed(p),
