@@ -1333,8 +1333,68 @@ def write_app_desktop() -> None:
         "Exec=firefox %u\nIcon=firefox\nNoDisplay=true\nTerminal=false\n"))
 
 
+USERJS_BEGIN = "// >>> passkey-qr managed >>>"
+USERJS_END = "// <<< passkey-qr managed <<<"
+USERJS_PREFS = (
+    ("security.webauth.webauthn_enable_usbtoken", "false"),
+    ("security.webauth.webauthn_enable_softtoken", "false"),
+    ("security.webauth.u2f", "false"),
+)
+
+
+def userjs_block() -> str:
+    prefs = "".join(f'user_pref("{name}", {value});\n' for name, value in USERJS_PREFS)
+    return (f"{USERJS_BEGIN}\n// Firefox's own USB/soft-token WebAuthn path only shows a \"Touch your security key\" prompt;\n"
+            f"// passkeys go through the credentialsd extension (QR).\n{prefs}{USERJS_END}\n")
+
+
+def managed_profiles() -> list[Path]:
+    """Existing profile dirs the deb Firefox may start: the install default and profiles.ini's Default=1."""
+    names = [install_default_name()]
+    cp = read_ini(MOZ_PROFILE / "profiles.ini")
+    for section in cp.sections():
+        if cp.get(section, "Default", fallback="0") == "1" and cp.has_option(section, "Path"):
+            names.append(cp.get(section, "Path"))
+    found: list[Path] = []
+    for name in names:
+        if not name:
+            continue
+        path = Path(name) if name.startswith("/") else MOZ_PROFILE / name
+        if path.is_dir() and path not in found:
+            found.append(path)
+    return found
+
+
+def userjs_with_block(text: str) -> str:
+    """``text`` with the managed block added or replaced; every other line stays as it was."""
+    block = userjs_block()
+    start = text.find(USERJS_BEGIN)
+    end = text.find(USERJS_END, start) if start != -1 else -1
+    if start != -1 and end != -1:
+        tail = text[end + len(USERJS_END):].lstrip("\n")
+        return text[:start] + block + tail
+    if start != -1:  # unterminated stale marker: drop only the marker, keep the foreign lines after it
+        text = text.replace(USERJS_BEGIN + "\n", "").replace(USERJS_BEGIN, "")
+    return text + ("" if not text or text.endswith("\n") else "\n") + block
+
+
+def usb_token_off_ok() -> bool:
+    profiles = managed_profiles()
+    return bool(profiles) and all(
+        userjs_block() in (read_text(profile / "user.js") or "") for profile in profiles)
+
+
+def disable_usb_token() -> None:
+    for profile in managed_profiles():
+        path = profile / "user.js"
+        write_file(path, userjs_with_block(read_text(path) or ""))
+    say("  takes effect at the next Firefox start (restart Firefox once)")
+
+
 def extension_actions() -> list[Action]:
     return [
+        Action("Firefox never offers a USB security key (user.js)", usb_token_off_ok, disable_usb_token,
+               hint="no Firefox profile found to write user.js into: start Firefox once."),
         Action("native-messaging host linked for Firefox (replaces a manual manifest)", nm_ok, link_nm,
                hint=lambda: f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
         Action("Firefox policy installs the signed extension on next start", policy_ok, install_policy),

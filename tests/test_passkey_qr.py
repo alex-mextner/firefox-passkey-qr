@@ -637,6 +637,83 @@ class Probes(Base):
             self.assertIsNone(pq.init_log("install"))
 
 
+class UsbTokenOff(unittest.TestCase):
+    """user.js managed block: Firefox must never offer a USB security key (tmp profile dirs only)."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.moz = self.root / "firefox"
+        (self.moz / "snap.default").mkdir(parents=True)
+        (self.moz / "fresh.default-release").mkdir()
+        for name, value in dict(MOZ_PROFILE=self.moz, say=lambda *a, **k: None).items():
+            patcher = mock.patch.object(pq, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        pq.DRY_RUN = False
+        self.write("profiles.ini", f"[Install{pq.DEB_INSTALL_HASH}]\nDefault=fresh.default-release\nLocked=1\n"
+                                   "[Profile0]\nName=snap\nIsRelative=1\nPath=snap.default\nDefault=1\n")
+        self.userjs = self.moz / "fresh.default-release" / "user.js"
+
+    def write(self, name, text):
+        (self.moz / name).write_text(text)
+
+    def test_profiles_are_the_install_default_and_the_profiles_ini_default(self):
+        self.assertEqual(pq.managed_profiles(),
+                         [self.moz / "fresh.default-release", self.moz / "snap.default"])
+
+    def test_missing_pref_is_pending_and_apply_writes_it(self):
+        self.assertFalse(pq.usb_token_off_ok())
+        pq.disable_usb_token()
+        self.assertTrue(pq.usb_token_off_ok())
+        for profile in pq.managed_profiles():
+            text = (profile / "user.js").read_text()
+            for name in ("webauthn_enable_usbtoken", "webauthn_enable_softtoken", "u2f"):
+                self.assertRegex(text, rf'user_pref\("security\.webauth\.{name}", false\);')
+
+    def test_one_profile_without_it_keeps_the_row_pending(self):
+        pq.disable_usb_token()
+        (self.moz / "snap.default" / "user.js").unlink()
+        self.assertFalse(pq.usb_token_off_ok())
+
+    def test_no_profile_means_not_ok(self):
+        shutil.rmtree(self.moz / "fresh.default-release")
+        shutil.rmtree(self.moz / "snap.default")
+        self.assertFalse(pq.usb_token_off_ok())
+
+    def test_apply_is_idempotent(self):
+        pq.disable_usb_token()
+        first = self.userjs.read_text()
+        pq.disable_usb_token()
+        self.assertEqual(self.userjs.read_text(), first)
+        self.assertEqual(first.count(pq.USERJS_BEGIN), 1)
+
+    def test_foreign_lines_survive_before_and_after_the_block(self):
+        self.userjs.write_text('user_pref("my.pref", 1);\n')
+        pq.disable_usb_token()
+        self.userjs.write_text(self.userjs.read_text() + 'user_pref("later.pref", 2);')
+        pq.disable_usb_token()
+        text = self.userjs.read_text()
+        self.assertIn('user_pref("my.pref", 1);', text)
+        self.assertIn('user_pref("later.pref", 2);', text)
+        self.assertEqual(text.count(pq.USERJS_BEGIN), 1)
+
+    def test_a_stale_block_is_replaced(self):
+        self.userjs.write_text(f'keep\n{pq.USERJS_BEGIN}\nuser_pref("security.webauth.webauthn_enable_usbtoken", true);\n'
+                               f'{pq.USERJS_END}\nkeep2\n')
+        self.assertFalse(pq.usb_token_off_ok())
+        pq.disable_usb_token()
+        text = self.userjs.read_text()
+        self.assertNotIn("usbtoken\", true", text)
+        self.assertTrue(pq.usb_token_off_ok())
+        self.assertIn("keep\n", text)
+        self.assertIn("keep2\n", text)
+
+    def test_it_is_a_required_row_for_check(self):
+        action = next(a for a in pq.extension_actions() if "USB security key" in a.name)
+        self.assertTrue(action.required)
+
+
 class PortalConfig(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())

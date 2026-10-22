@@ -130,6 +130,12 @@ Report breakage as issues.
   shows a live `[ ] a Bluetooth proxy is online in Home Assistant` line (not a
   `check` failure: an offline proxy is transient); power the ESP32 back on.
   `ha-ble-vhci --scanners` and `journalctl --user -u ha-ble-vhci` say the same.
+* "Touch your security key" doorhanger although you have no key: the extension's
+  content scripts have no `all_frames`, so WebAuthn calls from a frame (Google
+  sign-in uses one) hit Firefox's native USB-token path and wait forever. Step 5
+  writes a `passkey-qr managed` block into `user.js` of the Firefox profile(s)
+  (`security.webauth.webauthn_enable_usbtoken`, `..._softtoken`, `u2f` = false);
+  other `user.js` lines are kept. No root needed; restart Firefox once to apply.
 * The installer reloads user systemd and D-Bus itself, so no logout is needed after installing.
 * Extension: restart Firefox once. The installer's policy grants the extension access to all sites, and
   `passkey-qr status` checks that in the profile.
