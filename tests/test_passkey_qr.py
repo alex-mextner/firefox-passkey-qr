@@ -693,6 +693,67 @@ class PortalConfig(unittest.TestCase):
         self.assertTrue(pq.portal_conf_ok())
 
 
+class ProxyStatus(Base):
+    """`status` shows the live proxy line (bridge --scanners, subprocess mocked); `check` ignores it."""
+
+    def setUp(self):
+        super().setUp()
+        self.patched(BRIDGE_BIN=Path(HOME) / "bridge-bin", BRIDGE_CFG=Path(HOME) / "bridge-cfg")
+        pq.BRIDGE_CFG.mkdir(exist_ok=True)
+        pq.BRIDGE_BIN.write_text("")
+        (pq.BRIDGE_CFG / "token").write_text("secret")
+        (pq.BRIDGE_CFG / "env").write_text("HA_URL=http://ha:8123\n")
+        self.addCleanup(pq.BRIDGE_BIN.unlink)
+        self.addCleanup(shutil.rmtree, pq.BRIDGE_CFG, True)
+
+    def scanners(self, returncode, stdout=""):
+        return mock.patch.object(
+            pq.subprocess, "run", return_value=subprocess.CompletedProcess([], returncode, stdout, ""))
+
+    def test_online_proxy_is_listed(self):
+        out = "btproxy-kitchen (30:C9:22:D1:A5:72)  source=30:C9:22:D1:A5:72\n"
+        with self.scanners(0, out) as run:
+            pq.show_proxy_status()
+        self.assertIn("[x] a Bluetooth proxy is online in Home Assistant (btproxy-kitchen (30:C9:22:D1:A5:72))",
+                      self.rec.text)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[1:], ["--scanners", "--url", "http://ha:8123", "--token-file", str(pq.BRIDGE_CFG / "token")])
+        self.assertIn("timeout", run.call_args.kwargs)
+
+    def test_no_proxy_prints_an_actionable_hint(self):
+        with self.scanners(4):
+            pq.show_proxy_status()
+        self.assertIn("[ ] a Bluetooth proxy is online", self.rec.text)
+        self.assertIn("power on / reconnect the ESP32", self.rec.text)
+        self.assertIn("journalctl --user -u ha-ble-vhci", self.rec.text)
+
+    def test_unanswerable_query_prints_nothing(self):
+        with self.scanners(1):
+            pq.show_proxy_status()
+        with mock.patch.object(pq.subprocess, "run", side_effect=subprocess.TimeoutExpired("x", 30)):
+            pq.show_proxy_status()
+        self.assertEqual(self.rec.said, [])
+
+    def test_status_shows_it_only_when_the_bridge_provides_bluetooth(self):
+        self.patched(status_groups=lambda: [("3. Bluetooth via Home Assistant", [])], missing_apt=lambda: [])
+        with self.scanners(0, "p  source=1\n"):
+            self.patched(real_adapters=lambda: [])
+            pq.cmd_status(None)
+            self.assertIn("a Bluetooth proxy is online", self.rec.text)
+            self.rec.said.clear()
+            self.patched(real_adapters=lambda: ["hci0"])
+            pq.cmd_status(None)
+        self.assertNotIn("proxy", self.rec.text)
+
+    def test_check_does_not_ask(self):
+        def guarded(argv, *args, **kwargs):
+            self.assertNotIn("--scanners", argv)
+            return subprocess.CompletedProcess(argv, 1, "", "")
+
+        with mock.patch.object(pq.subprocess, "run", side_effect=guarded):
+            pq.status_rows()
+
+
 class Dependencies(unittest.TestCase):
     def test_a_too_old_tool_is_recognised_as_a_source_built_tool(self):
         log = "Program blueprint-compiler found: NO found 0.19.0 but need: '>= 0.20.4' (/usr/bin/blueprint-compiler)"

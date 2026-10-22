@@ -124,6 +124,12 @@ Report breakage as issues.
 * `passkey-qr status` shows what is missing; the log is `~/.local/state/passkey-qr/latest.log`.
 * Bridge: `journalctl --user -u ha-ble-vhci`; `bluetoothctl list`. A logout and login is needed only when the
   installer reports that your user was just added to `plugdev` (the udev rule itself uses the `uaccess` tag).
+* QR dialog hangs / "QR stopped working" with the bridge running: the ESP32
+  Bluetooth proxy is probably powered off or off Wi-Fi. The bridge stays up and
+  Home Assistant is fine, but the phone's advert never arrives. `passkey-qr status`
+  shows a live `[ ] a Bluetooth proxy is online in Home Assistant` line (not a
+  `check` failure: an offline proxy is transient); power the ESP32 back on.
+  `ha-ble-vhci --scanners` and `journalctl --user -u ha-ble-vhci` say the same.
 * The installer reloads user systemd and D-Bus itself, so no logout is needed after installing.
 * Extension: restart Firefox once. The installer's policy grants the extension access to all sites, and
   `passkey-qr status` checks that in the profile.

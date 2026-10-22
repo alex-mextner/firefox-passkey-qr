@@ -43,7 +43,7 @@ CACHE_DIR = HOME / ".cache/passkey-qr"
 BRIDGE_REPO = os.environ.get("PASSKEY_QR_BRIDGE_REPO", "https://github.com/alex-mextner/ha-ble-vhci")
 BRIDGE_DIR = HOME / ".local/share/ha-ble-vhci"
 BRIDGE_CFG = HOME / ".config/ha-ble-vhci"
-BRIDGE_VERSION = "0.1.5"
+BRIDGE_VERSION = "0.1.6"
 BRIDGE_UNIT = HOME / ".config/systemd/user/ha-ble-vhci.service"
 CREDSD_REPO = "https://github.com/linux-credentials/credentialsd"
 CREDSD_TAG = "v0.3.1"
@@ -560,6 +560,40 @@ def ha_valid() -> bool:
                               capture_output=True, timeout=30).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def bridge_proxies() -> list[str] | None:
+    """Names of the Bluetooth proxies online in Home Assistant right now (live, via the bridge's
+    ``--scanners``); ``[]`` when none, ``None`` when it cannot be asked (not set up / unreachable)."""
+    url = ha_url_configured()
+    token = BRIDGE_CFG / "token"
+    if not (BRIDGE_BIN.exists() and url and token.exists()):
+        return None
+    try:
+        result = subprocess.run([str(BRIDGE_BIN), "--scanners", "--url", url, "--token-file", str(token)],
+                                capture_output=True, text=True, timeout=15)  # the bridge itself waits <= ~12 s
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 4:
+        return []
+    if result.returncode != 0:
+        return None
+    return [line.split("  source=")[0] for line in result.stdout.splitlines() if line.strip()]
+
+
+PROXY_HINT = ("power on / reconnect the ESP32 Bluetooth proxy; the QR dialog hangs silently without one "
+              "(see journalctl --user -u ha-ble-vhci)")
+
+
+def show_proxy_status() -> None:
+    """Live, informational line: an offline proxy is transient, so it is never drift for ``check``/installer."""
+    proxies = bridge_proxies()
+    if proxies is None:
+        return
+    if proxies:
+        say(f"  [x] a Bluetooth proxy is online in Home Assistant ({', '.join(proxies)})")
+    else:
+        say("  [ ] a Bluetooth proxy is online in Home Assistant\n      -> " + PROXY_HINT)
 
 
 def bridge_unit_text() -> str:
@@ -1368,6 +1402,8 @@ def cmd_status(_: argparse.Namespace) -> None:
             continue
         say(f"\n== {title} ==")
         show_actions(actions)
+        if title.startswith("3."):
+            show_proxy_status()
     missing = missing_apt()
     if missing:
         say("\n  missing packages: " + " ".join(missing))
