@@ -385,7 +385,9 @@ def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
         have = installed_apt()
         pkgs = [p for p in resolve_packages([m for m in missing if m[1] not in SOURCE_BUILDERS]) if p not in have]
         if not pkgs or set(pkgs) <= tried:
-            tail = "\n".join(text.splitlines()[-15:])
+            lines = text.splitlines()
+            errs = [l for l in lines if re.search(r"error|ERROR|FAILED|panicked|not found", l)][:25]
+            tail = "\n".join(errs + ["...", *lines[-8:]])
             raise StepError(f"`{' '.join(cmd)}` failed and no installable dependency could be identified:\n{tail}")
         if not confirm(f"Install the missing build dependencies ({' '.join(pkgs)}) with apt?"):
             raise StepError("build dependencies not installed")
@@ -808,8 +810,15 @@ def is_built(p: Project) -> bool:
     return bool(files) and all(os.path.lexists(src) for src in files if src.startswith(str(p.build)))
 
 
+def libdex_gdbus_ready() -> bool:
+    return bool(out(["pkg-config", "--variable=gdbus_codegen_extension", "libdex-1"]))
+
+
 def build_project(p: Project) -> None:
     ensure_local_bin_on_path()
+    if p.name == "xdg-desktop-portal" and not DRY_RUN and not libdex_gdbus_ready():
+        raise StepError("the portal needs libdex built with gdbus support installed system-wide "
+                        "(pkg-config variable gdbus_codegen_extension is empty): install the libdex step first.")
     if p.name == "credentialsd" and rust_channel():
         os.environ["RUSTUP_TOOLCHAIN"] = rust_channel()  # overrides rust-toolchain.toml (no extra components)
     run_resolving(["meson", "setup", *p.setup, p.build_dir, "--reconfigure"], p.path)
