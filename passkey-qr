@@ -556,11 +556,109 @@ def copy_profile() -> None:
     while firefox_running() and not DRY_RUN:
         ask("  Close Firefox completely, then press Enter... ")
     run(["rsync", "-a", f"{prof}/", f"{MOZ_PROFILE / prof.name}/"])
+    if not DRY_RUN:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MIGRATED_NOTE.write_text(prof.name + "\n")
     if not (MOZ_PROFILE / "profiles.ini").exists():
         run(["cp", str(SNAP_PROFILE / "profiles.ini"), str(MOZ_PROFILE / "profiles.ini")])
     if not DRY_RUN:
         for lock in ("lock", ".parentlock"):
             (MOZ_PROFILE / prof.name / lock).unlink(missing_ok=True)
+
+
+def read_ini(path: Path) -> configparser.RawConfigParser:
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str  # keep key case (Name, Path, Default, Locked)
+    cp.read(path)
+    return cp
+
+
+def write_ini(cp: configparser.RawConfigParser, path: Path) -> None:
+    with open(path, "w") as handle:
+        cp.write(handle, space_around_delimiters=False)
+
+
+def install_default_name() -> str | None:
+    """The profile this Firefox install starts with (installs.ini / profiles.ini)."""
+    for ini in (MOZ_PROFILE / "installs.ini", MOZ_PROFILE / "profiles.ini"):
+        cp = read_ini(ini)
+        for section in cp.sections():
+            if cp.has_option(section, "Default") and (ini.name == "installs.ini" or section.startswith("Install")):
+                return cp.get(section, "Default")
+    cp = read_ini(MOZ_PROFILE / "profiles.ini")
+    for section in cp.sections():
+        if section.startswith("Profile") and cp.get(section, "Default", fallback="") == "1":
+            return cp.get(section, "Path", fallback=None)
+    return None
+
+
+def active_profile() -> Path | None:
+    name = install_default_name()
+    return MOZ_PROFILE / name if name else None
+
+
+MIGRATED_NOTE = STATE_DIR / "migrated-profile"
+
+
+def migrated_name() -> str | None:
+    """Name of the profile copied from the snap (it may be gone from ~/snap after `snap remove`)."""
+    candidates: list[str | None] = [snap_profile().name if snap_profile() else None]
+    try:
+        candidates.append(MIGRATED_NOTE.read_text().strip())
+    except OSError:
+        pass
+    # profiles.ini copied from the snap marks its profile Default=1; the deb then made its own
+    # install default. A Default=1 profile that is not the install default is the migrated one.
+    cp = read_ini(MOZ_PROFILE / "profiles.ini")
+    candidates += [cp.get(sec, "Path", fallback=None) for sec in cp.sections()
+                   if sec.startswith("Profile") and cp.get(sec, "Default", fallback="") == "1"]
+    for name in candidates:
+        if name and (MOZ_PROFILE / name / "prefs.js").exists():
+            return name
+    return None
+
+
+def migrated_is_default() -> bool:
+    name = migrated_name()
+    return name is None or install_default_name() == name
+
+
+def set_install_default() -> None:
+    """Make the migrated snap profile the one deb Firefox starts (it created a fresh, locked one)."""
+    name = migrated_name()
+    assert name
+    while firefox_running() and not DRY_RUN:
+        ask("  Close Firefox completely, then press Enter... ")
+    say(f"  start profile: {install_default_name()} -> {name} (backups: *.bak-passkey-qr; "
+        "the fresh profile is kept, nothing is deleted)")
+    if DRY_RUN:
+        return
+    for fname in ("profiles.ini", "installs.ini"):
+        path = MOZ_PROFILE / fname
+        if path.exists():
+            shutil.copy2(path, path.with_name(fname + ".bak-passkey-qr"))
+    cp = read_ini(MOZ_PROFILE / "profiles.ini")
+    if not any(cp.get(sec, "Path", fallback="") == name for sec in cp.sections()):
+        index = 0
+        while cp.has_section(f"Profile{index}"):
+            index += 1
+        cp.add_section(f"Profile{index}")
+        for key, value in (("Name", "migrated"), ("IsRelative", "1"), ("Path", name)):
+            cp.set(f"Profile{index}", key, value)
+    for sec in cp.sections():
+        if sec.startswith("Profile"):
+            if cp.get(sec, "Path", fallback="") == name:
+                cp.set(sec, "Default", "1")
+            elif cp.has_option(sec, "Default"):
+                cp.remove_option(sec, "Default")
+        elif sec.startswith("Install") and cp.has_option(sec, "Default"):
+            cp.set(sec, "Default", name)
+    write_ini(cp, MOZ_PROFILE / "profiles.ini")
+    inst = read_ini(MOZ_PROFILE / "installs.ini")
+    for sec in inst.sections():
+        inst.set(sec, "Default", name)
+    if inst.sections():
+        write_ini(inst, MOZ_PROFILE / "installs.ini")
 
 
 def firefox_actions() -> list[Action]:
@@ -571,6 +669,8 @@ def firefox_actions() -> list[Action]:
                # Ubuntu's transitional package has epoch 1:, so Mozilla's deb counts as a downgrade
                lambda: apt_install(["firefox"], extra=["--allow-downgrades"])),
         Action("snap profile copied to ~/.mozilla/firefox", profile_copied, copy_profile),
+        Action("your migrated profile is the one Firefox starts (deb Firefox made a fresh one)",
+               migrated_is_default, set_install_default),
         Action("Firefox snap removed (snapd keeps an automatic snapshot)", lambda: not snap_firefox_present(),
                lambda: run(["snap", "remove", "firefox"], sudo=True), optional=True),
     ]
@@ -724,7 +824,8 @@ def link_nm() -> None:
 
 
 def extension_in_profile() -> bool:
-    for ext_json in MOZ_PROFILE.glob("*/extensions.json"):
+    profile = active_profile()
+    for ext_json in ([profile / "extensions.json"] if profile else []):
         try:
             for addon in json.loads(ext_json.read_text()).get("addons", []):
                 if addon.get("id") == XPI_ID and addon.get("active"):
@@ -739,7 +840,8 @@ FIREFOX_BIN = "/usr/lib/firefox/firefox"
 
 def extension_granted() -> bool:
     """The policy install grants <all_urls> automatically; confirm it in the profile."""
-    for prefs in MOZ_PROFILE.glob("*/extension-preferences.json"):
+    profile = active_profile()
+    for prefs in ([profile / "extension-preferences.json"] if profile else []):
         try:
             entry = json.loads(prefs.read_text()).get(XPI_ID, {})
         except (OSError, json.JSONDecodeError):
@@ -883,6 +985,7 @@ def log_snapshot() -> None:
     for cmd in cmds:
         log(f"$ {' '.join(cmd)}")
         log(out(cmd, timeout=40) or "(empty)")
+    log(f"active profile: {active_profile()} (installs.ini default: {install_default_name()})")
     for prefs in MOZ_PROFILE.glob("*/extension-preferences.json"):
         try:
             log(f"{prefs}: {json.loads(prefs.read_text()).get(XPI_ID)}")
