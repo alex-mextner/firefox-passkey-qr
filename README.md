@@ -100,19 +100,24 @@ Home Assistant tokens are never logged.
 
 ## Status / honesty
 
-Verified on real hardware (Ubuntu 26.04, Firefox 158, 2026-10-22): a PC without Bluetooth, an ESPHome
-Bluetooth proxy on an ESP32, Home Assistant over Tailscale, `ha-ble-vhci` as a virtual `hci0`, `credentialsd` with
-the patched portal, and a real passkey login from an iPhone through the QR code. The package, build and install
-steps were also run unattended (`--yes`) on a pristine Ubuntu 26.04.1 root in an unprivileged `bwrap`, up to the
-first step that needs a systemd user session.
+Last verified on 2026-10-22 (Ubuntu 26.04, Firefox 158.0.1):
 
-Not verified: an unattended run through `ubuntu-tweak init` on a brand-new machine, an Android phone, and a PC with
-a physical Bluetooth adapter (the step is skipped there by design). Report breakage as issues.
+- hardware: a PC without Bluetooth, an ESPHome Bluetooth proxy on an ESP32, Home Assistant over Tailscale;
+- software: `ha-ble-vhci` as a virtual `hci0`, `credentialsd` with the patched portal;
+- end to end: a real passkey login from an iPhone through the QR code;
+- unattended (`--yes`): the package, build and install steps on a pristine Ubuntu 26.04.1 root in an
+  unprivileged `bwrap`, up to the first step that needs a systemd user session;
+- in unit tests: the advertisement path against a mock Home Assistant and Bumble's controller, the `--dry-run`
+  plan, the profile and portal edits (`python3 -m unittest discover -s tests`).
 
-Two root causes worth knowing when something stops working: the portal only accepts the helper's app id when
-`org.mozilla.firefox.desktop` exists (the installer creates it unless one is already installed), and the portal
-only exports the Credential interface when a `[preferred]` entry in `~/.config/xdg-desktop-portal/portals.conf`
-names `credentialsd` for `org.freedesktop.impl.portal.experimental.Credential`.
+Not verified yet:
+
+- a run through [ubuntu-tweaks](https://github.com/alex-mextner/ubuntu-tweaks) (`ubuntu-tweak init`) on a
+  brand-new machine, [#11](https://github.com/alex-mextner/firefox-passkey-qr/issues/11);
+- an Android phone and a PC with a physical Bluetooth adapter (there the `ha-ble-vhci` step is skipped because a
+  local adapter is found), [#12](https://github.com/alex-mextner/firefox-passkey-qr/issues/12).
+
+Report breakage as issues.
 
 ## Troubleshooting
 
@@ -122,3 +127,13 @@ names `credentialsd` for `org.freedesktop.impl.portal.experimental.Credential`.
 * After step 4 log out and in once (D-Bus/systemd activation files).
 * Extension: restart Firefox once; if it does not work, allow all sites in `about:addons` -> credentialsd-helper -> Permissions.
 * Services: `journalctl --user -u xdg-desktop-portal -u xyz.iinuwa.credentialsd.Credentials`.
+* `passkey-qr` registers the helper's app id with the portal; the portal only accepts ids that have a desktop
+  file, so `org.mozilla.firefox.desktop` must exist. The installer creates it unless an
+  `org.mozilla.firefox.desktop` entry already exists (for example the Flatpak Firefox).
+* The portal only exports the Credential interface when a `[preferred]` entry names `credentialsd` for it. The
+  installer writes this to `~/.config/xdg-desktop-portal/portals.conf`:
+
+  ```ini
+  [preferred]
+  org.freedesktop.impl.portal.experimental.Credential=credentialsd
+  ```
