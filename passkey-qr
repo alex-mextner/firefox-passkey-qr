@@ -67,6 +67,8 @@ LOCAL_BIN = HOME / ".local/bin"
 CARGO_BIN = HOME / ".cargo/bin"
 PORTAL_CONF = HOME / ".config/xdg-desktop-portal/portals.conf"
 CREDENTIAL_IMPL_IFACE = "org.freedesktop.impl.portal.experimental.Credential"
+FIREFOX_APP_ID = "org.mozilla.firefox"  # app id the credentialsd helper registers with the portal
+APP_DESKTOP = HOME / ".local/share/applications/org.mozilla.firefox.desktop"
 PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
 PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
@@ -1060,10 +1062,36 @@ def install_policy() -> None:
     sudo_write(FIREFOX_POLICIES, json.dumps(data, indent=2) + "\n")
 
 
+REGISTER_PROBE = (
+    "import asyncio\nfrom dbus_next.aio import MessageBus\nfrom dbus_next import Message\n"
+    "async def main():\n"
+    "    bus = await MessageBus().connect()\n"
+    "    r = await bus.call(Message('org.freedesktop.portal.Desktop','/org/freedesktop/portal/desktop',"
+    "'org.freedesktop.host.portal.Registry','Register',signature='sa{sv}',body=[%r,{}]))\n"
+    "    print('OK' if r.message_type.name == 'METHOD_RETURN' else 'ERR ' + str(r.body))\n"
+    "asyncio.run(main())\n"
+)
+
+
+def portal_registry_ok() -> bool:
+    """The helper must register its app id with the portal, otherwise credentialsd rejects every
+    request ('App ID could not be verified'). The portal only accepts ids with a .desktop file."""
+    return out(["python3", "-c", REGISTER_PROBE % FIREFOX_APP_ID], timeout=30).endswith("OK")
+
+
+def write_app_desktop() -> None:
+    write_file(APP_DESKTOP, (
+        "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Firefox (portal app id)\n"
+        "Comment=App id registered by the credentialsd native-messaging helper (passkey-qr); not shown in menus\n"
+        "Exec=firefox %u\nIcon=firefox\nNoDisplay=true\nTerminal=false\n"))
+
+
 def extension_actions() -> list[Action]:
     return [
         Action("native-messaging host linked for Firefox (replaces a manual manifest)", nm_ok, link_nm,
                hint=f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
+        Action("portal accepts the helper's app id (needs org.mozilla.firefox.desktop)", portal_registry_ok,
+               write_app_desktop, hint="The portal rejects the helper's registration: see the log."),
         Action("Firefox policy installs the signed extension on next start", policy_ok, install_policy),
         Action("Firefox restarted: extension active with access to all sites", extension_ready, restart_firefox,
                hint="Firefox did not report the extension as installed within 2 minutes: see "
