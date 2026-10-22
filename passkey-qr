@@ -521,12 +521,33 @@ def ha_candidates() -> list[str]:
 BRIDGE_BIN = BRIDGE_DIR / "venv/bin/ha-ble-vhci"
 
 
+def version_tuple(version: str) -> tuple[tuple[int, ...], int]:
+    """Orderable form of a PEP 440 release: '0.1.10' -> ((0, 1, 10), 1). Trailing zeros do not count ('0.2' equals
+    '0.2.0'); a pre-/dev-release sorts before its release ('0.1.6rc1' < '0.1.6') and a post-release after it
+    ('0.1.6.post1' > '0.1.6'); a '+local' part is ignored."""
+    numbers: list[int] = []
+    rank = 1  # 0: pre/dev release, 1: the release, 2: post release
+    for piece in version.split("+")[0].split("."):
+        match = re.fullmatch(r"(\d+)(.*)", piece)
+        if match:
+            numbers.append(int(match.group(1)))
+            suffix = match.group(2)
+        else:
+            suffix = piece
+        if suffix:
+            rank = 2 if suffix.startswith("post") else 0
+            break
+    while numbers and numbers[-1] == 0:
+        numbers.pop()
+    return tuple(numbers), rank
+
+
 def bridge_current() -> bool:
     pip = BRIDGE_DIR / "venv/bin/pip"
     if not (pip.exists() and BRIDGE_BIN.exists()):
         return False
     match = re.search(r"^Version: (\S+)", out([str(pip), "show", "ha-ble-vhci"]), re.M)
-    return bool(match) and match.group(1) == BRIDGE_VERSION
+    return bool(match) and version_tuple(match.group(1)) >= version_tuple(BRIDGE_VERSION)  # newer is fine: never downgrade
 
 
 def ha_valid() -> bool:
@@ -628,7 +649,7 @@ def adapter_appears() -> None:
 
 def bluetooth_actions() -> list[Action]:
     return [
-        Action(f"ha-ble-vhci {BRIDGE_VERSION} installed", bridge_current, install_bridge),
+        Action(f"ha-ble-vhci {BRIDGE_VERSION} or newer installed", bridge_current, install_bridge),
         Action("Home Assistant URL + token stored", lambda: bool(ha_url_configured()) and (BRIDGE_CFG / "token").exists(), configure_ha),
         Action("Home Assistant reachable, token valid and admin", ha_valid, configure_ha,
                hint="Check the URL/token (the token must belong to an admin user)."),

@@ -543,6 +543,74 @@ class FirefoxProfiles(unittest.TestCase):
         self.assertIsNone(pq.install_default_name())  # checks stay tolerant
 
 
+class BridgeVersion(Base):
+    def venv(self, version):
+        """A fake bridge venv whose `pip show` reports `version` (None: not installed)."""
+        root = Path(tempfile.mkdtemp())
+        (root / "venv/bin").mkdir(parents=True)
+        if version:
+            pip = root / "venv/bin/pip"
+            pip.write_text(f"#!/bin/sh\necho 'Name: ha-ble-vhci'\necho 'Version: {version}'\n")
+            pip.chmod(0o755)
+            (root / "venv/bin/ha-ble-vhci").write_text("#!/bin/sh\n")
+        self.patched(BRIDGE_DIR=root, BRIDGE_BIN=root / "venv/bin/ha-ble-vhci")
+
+    def test_versions_compare_as_numbers(self):
+        self.assertGreater(pq.version_tuple("0.1.10"), pq.version_tuple("0.1.9"))
+        self.assertEqual(pq.version_tuple("0.2"), pq.version_tuple("0.2.0"))
+        self.assertEqual(pq.version_tuple("0.1.6+local"), pq.version_tuple("0.1.6"))
+
+    def test_a_pre_release_is_older_than_its_release(self):
+        for pre in ("0.1.6rc1", "0.1.6.dev0", "0.1.6a1", "0.1.6b2"):
+            self.assertLess(pq.version_tuple(pre), pq.version_tuple("0.1.6"), pre)
+            self.assertGreater(pq.version_tuple(pre), pq.version_tuple("0.1.5"), pre)
+        self.assertLess(pq.version_tuple("0.2.0rc1"), pq.version_tuple("0.2"))
+
+    def test_a_post_release_is_newer_than_its_release_and_never_downgraded(self):
+        self.assertGreater(pq.version_tuple("0.1.6.post1"), pq.version_tuple("0.1.6"))
+        self.assertGreater(pq.version_tuple("0.1.6post2"), pq.version_tuple("0.1.6"))
+        with mock.patch.object(pq, "BRIDGE_VERSION", "0.1.6"):
+            self.venv("0.1.6.post1")
+            self.assertTrue(pq.bridge_current())
+
+    def test_a_pre_release_of_the_pinned_version_is_upgraded(self):
+        with mock.patch.object(pq, "BRIDGE_VERSION", "0.1.6"):
+            self.venv("0.1.6rc1")
+            self.assertFalse(pq.bridge_current())
+            self.venv("0.1.6")
+            self.assertTrue(pq.bridge_current())
+            self.venv("0.1.6.0")
+            self.assertTrue(pq.bridge_current())
+
+    def test_a_newer_bridge_is_current_and_an_older_or_missing_one_is_not(self):
+        pinned = pq.BRIDGE_VERSION
+        newer = ".".join([*pinned.split(".")[:-1], str(int(pinned.split(".")[-1]) + 1)])
+        self.venv(newer)
+        self.assertTrue(pq.bridge_current())
+        self.venv(pinned)
+        self.assertTrue(pq.bridge_current())
+        self.venv("0.0.1")
+        self.assertFalse(pq.bridge_current())
+        self.venv(None)
+        self.assertFalse(pq.bridge_current())
+
+    def test_a_newer_bridge_is_never_reinstalled_or_restarted(self):
+        self.venv("99.0.0")
+        self.set_flags(yes=True)
+        action = next(a for a in pq.bluetooth_actions() if "or newer installed" in a.name)
+        pq.run_actions("3. Bluetooth", [action])
+        self.assertEqual(self.rec.commands, [])  # no pip, no systemctl restart
+
+    def test_an_older_bridge_is_upgraded_to_the_pinned_version(self):
+        self.venv("0.0.1")
+        self.set_flags(yes=True)
+        action = next(a for a in pq.bluetooth_actions() if "or newer installed" in a.name)
+        action = dataclasses.replace(action, apply=lambda: pq.run(["pip", "install", "ha-ble-vhci"]))
+        with self.assertRaises(pq.StepError):  # the recorded run does not change the fake venv: re-check fails
+            pq.run_actions("3. Bluetooth", [action])
+        self.assertIn(["pip", "install", "ha-ble-vhci"], self.rec.commands)
+
+
 class Spawning(Base):
     def test_a_missing_binary_is_a_failed_step_not_a_traceback(self):
         self.patched(run_stream=pq.run_stream)  # the real one: Base replaces run, not run_stream
