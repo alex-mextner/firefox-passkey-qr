@@ -962,9 +962,13 @@ def nm_link() -> Path:
 
 
 def nm_target() -> Path:
-    lib64 = Path("/usr/local/lib64")
-    libdir = lib64 if lib64.is_dir() and not lib64.is_symlink() else Path("/usr/local/lib")
-    return libdir / "mozilla/native-messaging-hosts" / NM_MANIFEST
+    """Where meson installed the manifest (libdir is multiarch on Debian/Ubuntu: lib/x86_64-linux-gnu)."""
+    for dest in installed_map(PROJECTS[0]).values():
+        if dest.endswith(NM_MANIFEST):
+            return Path(dest)
+    for found in sorted(Path("/usr/local").glob(f"lib*/**/mozilla/native-messaging-hosts/{NM_MANIFEST}")):
+        return found
+    return Path("/usr/local/lib/mozilla/native-messaging-hosts") / NM_MANIFEST
 
 
 def nm_ok() -> bool:
