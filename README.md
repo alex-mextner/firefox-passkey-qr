@@ -100,11 +100,19 @@ Home Assistant tokens are never logged.
 
 ## Status / honesty
 
-Verified in development: the bridge's advertisement path against a mock Home
-Assistant and Bumble's controller (HCI events produced as expected), the
-installer's detection and `--dry-run` plan. **Not** verified end to end on
-real hardware: `/dev/vhci` + BlueZ with the bridge, the credentialsd/portal
-build on Ubuntu 26.04, and an actual phone scan. Report breakage as issues.
+Verified on real hardware (Ubuntu 26.04, Firefox 158, 2026-10-22): a PC without Bluetooth, an ESPHome
+Bluetooth proxy on an ESP32, Home Assistant over Tailscale, `ha-ble-vhci` as a virtual `hci0`, `credentialsd` with
+the patched portal, and a real passkey login from an iPhone through the QR code. The package, build and install
+steps were also run unattended (`--yes`) on a pristine Ubuntu 26.04.1 root in an unprivileged `bwrap`, up to the
+first step that needs a systemd user session.
+
+Not verified: an unattended run through `ubuntu-tweak init` on a brand-new machine, an Android phone, and a PC with
+a physical Bluetooth adapter (the step is skipped there by design). Report breakage as issues.
+
+Two root causes worth knowing when something stops working: the portal only accepts the helper's app id when
+`org.mozilla.firefox.desktop` exists (the installer creates it unless one is already installed), and the portal
+only exports the Credential interface when a `[preferred]` entry in `~/.config/xdg-desktop-portal/portals.conf`
+names `credentialsd` for `org.freedesktop.impl.portal.experimental.Credential`.
 
 ## Troubleshooting
 
