@@ -122,10 +122,11 @@ Report breakage as issues.
 ## Troubleshooting
 
 * `passkey-qr status` shows what is missing; the log is `~/.local/state/passkey-qr/latest.log`.
-* Bridge: `journalctl --user -u ha-ble-vhci`; `bluetoothctl list`; after being
-  added to `plugdev`, log out and in once.
-* After step 4 log out and in once (D-Bus/systemd activation files).
-* Extension: restart Firefox once; if it does not work, allow all sites in `about:addons` -> credentialsd-helper -> Permissions.
+* Bridge: `journalctl --user -u ha-ble-vhci`; `bluetoothctl list`. A logout and login is needed only when the
+  installer reports that your user was just added to `plugdev` (the udev rule itself uses the `uaccess` tag).
+* The installer reloads user systemd and D-Bus itself, so no logout is needed after installing.
+* Extension: restart Firefox once. The installer's policy grants the extension access to all sites, and
+  `passkey-qr status` checks that in the profile.
 * Services: `journalctl --user -u xdg-desktop-portal -u xyz.iinuwa.credentialsd.Credentials`.
 * `passkey-qr` registers the helper's app id with the portal; the portal only accepts ids that have a desktop
   file, so `org.mozilla.firefox.desktop` must exist. The installer creates it unless an
