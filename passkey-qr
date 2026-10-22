@@ -89,8 +89,39 @@ class StepError(Exception):
 
 
 # --------------------------------------------------------------------------- helpers
+STATE_DIR = Path(os.environ.get("PASSKEY_QR_STATE", HOME / ".local/state/passkey-qr"))
+LOG_FILE = None  # opened by init_log()
+
+
+def init_log(command: str) -> Path:
+    """Mirror everything shown on screen (and all command output) into a log file."""
+    global LOG_FILE
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{command}.log"
+    LOG_FILE = open(path, "a", buffering=1)
+    if command == "install":  # latest.log always points to the last install run
+        latest = STATE_DIR / "latest.log"
+        latest.unlink(missing_ok=True)
+        latest.symlink_to(path.name)
+    log(f"passkey-qr {command} started {time.strftime('%Y-%m-%d %H:%M:%S')} dry_run={DRY_RUN} user={getpass.getuser()}")
+    return path
+
+
+def log(text: str) -> None:
+    if LOG_FILE:
+        LOG_FILE.write(text if text.endswith("\n") else text + "\n")
+
+
 def say(msg: str = "") -> None:
     print(msg, flush=True)
+    log(msg)
+
+
+def ask(prompt: str) -> str:
+    log(f"{prompt}<waiting for input>")
+    answer = input(prompt)
+    log(f"  -> {answer!r}")
+    return answer
 
 
 def confirm(question: str) -> bool:
@@ -98,7 +129,7 @@ def confirm(question: str) -> bool:
         say(f"? {question} [auto-yes in dry-run]")
         return True
     while True:
-        answer = input(f"? {question} [y/N] ").strip().lower()
+        answer = ask(f"? {question} [y/N] ").strip().lower()
         if answer in ("y", "yes"):
             return True
         if answer in ("", "n", "no"):
@@ -112,28 +143,33 @@ def _argv(cmd: list[str] | str, sudo: bool) -> list[str]:
     return argv
 
 
-def run(cmd: list[str] | str, *, sudo: bool = False, cwd: Path | None = None,
-        check: bool = True) -> subprocess.CompletedProcess:
-    argv = _argv(cmd, sudo)
-    say("  $ " + " ".join(shlex.quote(a) for a in argv))
-    if DRY_RUN:
-        return subprocess.CompletedProcess(argv, 0, "", "")
-    return subprocess.run(argv, cwd=cwd, check=check, text=True)
-
-
 def run_stream(cmd: list[str] | str, *, cwd: Path | None = None, sudo: bool = False) -> tuple[int, str]:
-    """Run a command, echo its output live and also return it."""
+    """Run a command, echo its output live (screen and log) and also return it."""
     argv = _argv(cmd, sudo)
     say("  $ " + " ".join(shlex.quote(a) for a in argv))
     if DRY_RUN:
         return 0, ""
-    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    started = time.time()
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            errors="replace")
     lines: list[str] = []
     assert proc.stdout
     for line in proc.stdout:
         sys.stdout.write(line)
+        log(line)
         lines.append(line)
-    return proc.wait(), "".join(lines)
+    rc = proc.wait()
+    log(f"  [exit {rc} after {time.time() - started:.1f}s]")
+    return rc, "".join(lines)
+
+
+def run(cmd: list[str] | str, *, sudo: bool = False, cwd: Path | None = None,
+        check: bool = True) -> subprocess.CompletedProcess:
+    argv = _argv(cmd, sudo)
+    rc, text = run_stream(cmd, cwd=cwd, sudo=sudo)
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, argv, output=text)
+    return subprocess.CompletedProcess(argv, rc, text, "")
 
 
 def out(cmd: list[str], timeout: float = 20) -> str:
@@ -398,6 +434,11 @@ def install_bridge() -> None:
         run(["systemctl", "--user", "restart", "ha-ble-vhci"])  # pick up the new version
 
 
+def _hidden(prompt: str) -> str:
+    log(f"{prompt}<hidden input, not logged>")
+    return getpass.getpass(prompt).strip()
+
+
 def configure_ha() -> None:
     url = ha_url_configured()
     if not url:
@@ -408,13 +449,13 @@ def configure_ha() -> None:
         if found and confirm(f"Use Home Assistant at {found[0]}?"):
             url = found[0]
         elif not DRY_RUN:
-            url = input("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to abort: ").strip().rstrip("/")
+            url = ask("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to abort: ").strip().rstrip("/")
         if not url:
             raise StepError("No Home Assistant configured: plug in a USB Bluetooth (BLE) dongle instead.")
     elif (BRIDGE_CFG / "token").exists():
         say(f"  the stored token for {url} was rejected; enter a new one")
     say(f"  Create a long-lived token of an admin user: {url}/profile/security -> Long-lived access tokens")
-    token = "dry-run-token" if DRY_RUN else getpass.getpass("  Paste the token (hidden, Enter to abort): ").strip()
+    token = "dry-run-token" if DRY_RUN else _hidden("  Paste the token (hidden, Enter to abort): ")
     if not token:
         raise StepError("no token given")
     write_file(BRIDGE_CFG / "token", token + "\n", 0o600)
@@ -513,7 +554,7 @@ def copy_profile() -> None:
     prof = snap_profile()
     assert prof
     while firefox_running() and not DRY_RUN:
-        input("  Close Firefox completely, then press Enter... ")
+        ask("  Close Firefox completely, then press Enter... ")
     run(["rsync", "-a", f"{prof}/", f"{MOZ_PROFILE / prof.name}/"])
     if not (MOZ_PROFILE / "profiles.ini").exists():
         run(["cp", str(SNAP_PROFILE / "profiles.ini"), str(MOZ_PROFILE / "profiles.ini")])
@@ -611,6 +652,31 @@ def build_project(p: Project) -> None:
     run_resolving(["meson", "compile", "-C", p.build_dir], p.path)
 
 
+def credentialsd_activatable() -> bool:
+    return "xyz.iinuwa.credentialsd" in out(["busctl", "--user", "list", "--activatable", "--no-pager"])
+
+
+def portal_credential_ready() -> bool:
+    intro = out(["busctl", "--user", "introspect", "org.freedesktop.portal.Desktop",
+                 "/org/freedesktop/portal/desktop", "--no-pager"], timeout=30)
+    return "org.freedesktop.portal.experimental.Credential" in intro
+
+
+def reload_user_services() -> None:
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "reload", "dbus"], check=False)  # dbus-daemon re-reads service files
+
+
+def restart_portal() -> None:
+    reload_user_services()
+    run(["systemctl", "--user", "restart", "xdg-desktop-portal"])
+    if not DRY_RUN:
+        for _ in range(15):
+            if portal_credential_ready():
+                return
+            time.sleep(1)
+
+
 def credentialsd_actions() -> list[Action]:
     actions: list[Action] = []
     for p in PROJECTS:
@@ -626,6 +692,12 @@ def credentialsd_actions() -> list[Action]:
                           lambda: read_text(PORTAL_DROPIN) == PORTAL_DROPIN_TEXT,
                           lambda: (write_file(PORTAL_DROPIN, PORTAL_DROPIN_TEXT),
                                    run(["systemctl", "--user", "daemon-reload"]))))
+    actions += [
+        Action("session bus knows the credentialsd service files", credentialsd_activatable, reload_user_services,
+               hint="Log out and back in once so the session picks up the new activation files, then re-run."),
+        Action("patched portal answers with the Credential interface", portal_credential_ready, restart_portal,
+               hint="Log out and back in once, then re-run; see the log for the portal journal."),
+    ]
     return actions
 
 
@@ -662,6 +734,50 @@ def extension_in_profile() -> bool:
     return False
 
 
+FIREFOX_BIN = "/usr/lib/firefox/firefox"
+
+
+def extension_granted() -> bool:
+    """The policy install grants <all_urls> automatically; confirm it in the profile."""
+    for prefs in MOZ_PROFILE.glob("*/extension-preferences.json"):
+        try:
+            entry = json.loads(prefs.read_text()).get(XPI_ID, {})
+        except (OSError, json.JSONDecodeError):
+            continue
+        if "<all_urls>" in entry.get("origins", []):
+            return True
+    return False
+
+
+def extension_ready() -> bool:
+    return extension_in_profile() and extension_granted()
+
+
+def restart_firefox() -> None:
+    if out(["pgrep", "-x", "firefox"]):
+        say("  closing Firefox (session restore brings your tabs back)")
+        run(["pkill", "-TERM", "-x", "firefox"], check=False)
+        for _ in range(40):
+            if not out(["pgrep", "-x", "firefox"]):
+                break
+            time.sleep(1)
+        else:
+            raise StepError("Firefox did not close within 40 s: close it manually and re-run.")
+    fflog = STATE_DIR / "firefox.log"
+    say(f"  starting Firefox (its output goes to {fflog})")
+    if DRY_RUN:
+        run([FIREFOX_BIN])
+        return
+    with open(fflog, "a") as handle:
+        subprocess.Popen([FIREFOX_BIN], start_new_session=True, stdout=handle, stderr=handle,
+                         stdin=subprocess.DEVNULL)
+    for _ in range(60):
+        time.sleep(2)
+        if extension_ready():
+            return
+    # run_actions turns a still-failing check into a StepError with the hint
+
+
 def policy_data() -> dict:
     try:
         return json.loads(FIREFOX_POLICIES.read_text())
@@ -688,6 +804,9 @@ def extension_actions() -> list[Action]:
         Action("native-messaging host linked for Firefox (replaces a manual manifest)", nm_ok, link_nm,
                hint=f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
         Action("Firefox policy installs the signed extension on next start", policy_ok, install_policy),
+        Action("Firefox restarted: extension active with access to all sites", extension_ready, restart_firefox,
+               hint="Firefox did not report the extension as installed within 2 minutes: see "
+                    f"{STATE_DIR}/firefox.log and about:policies / about:addons."),
     ]
 
 
@@ -747,6 +866,43 @@ def cmd_status(_: argparse.Namespace) -> None:
         say("\n  missing packages: " + " ".join(missing))
 
 
+def log_snapshot() -> None:
+    """Write the facts needed to debug a run into the log file (no secrets)."""
+    cmds = [
+        ["uname", "-a"], [FIREFOX_BIN, "--version"], ["bluetoothctl", "list"],
+        ["systemctl", "--user", "is-active", "ha-ble-vhci", "xdg-desktop-portal", "dbus"],
+        ["busctl", "--user", "list", "--activatable", "--no-pager"],
+        ["busctl", "--user", "introspect", "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "--no-pager"],
+        ["cat", str(FIREFOX_POLICIES)], ["ls", "-l", str(HOME / ".mozilla/native-messaging-hosts")],
+        ["journalctl", "--user", "-u", "ha-ble-vhci", "-n", "25", "--no-pager"],
+        ["journalctl", "--user", "-u", "xdg-desktop-portal", "-n", "25", "--no-pager"],
+        ["journalctl", "--user", "-n", "40", "--no-pager", "-t", "credentialsd"],
+        ["journalctl", "--user", "-n", "25", "--no-pager", "-u", "xyz.iinuwa.credentialsd*"],
+    ]
+    log("\n===== snapshot =====")
+    for cmd in cmds:
+        log(f"$ {' '.join(cmd)}")
+        log(out(cmd, timeout=40) or "(empty)")
+    for prefs in MOZ_PROFILE.glob("*/extension-preferences.json"):
+        try:
+            log(f"{prefs}: {json.loads(prefs.read_text()).get(XPI_ID)}")
+        except (OSError, json.JSONDecodeError):
+            pass
+    log(f"extension_in_profile={extension_in_profile()} granted={extension_granted()}")
+    log("===== end snapshot =====")
+
+
+def open_test_page() -> None:
+    url = "https://webauthn.io"
+    if not confirm(f"Open {url} in Firefox now to test the phone/QR option?"):
+        return
+    if DRY_RUN:
+        run([FIREFOX_BIN, "--new-tab", url])
+        return
+    subprocess.Popen([FIREFOX_BIN, "--new-tab", url], start_new_session=True, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
+
 def cmd_install(_: argparse.Namespace) -> None:
     say("passkey-qr changes your system step by step; every step asks first, and anything already\n"
         "applied (checked against the real system state) is skipped.")
@@ -754,9 +910,13 @@ def cmd_install(_: argparse.Namespace) -> None:
         step()
     say("\nFinal state:")
     cmd_status(argparse.Namespace())
-    say(f"  extension active in your Firefox profile: {'yes' if extension_in_profile() else 'not yet (restart Firefox)'}")
-    say("\nNext: restart Firefox, open about:addons -> credentialsd-helper -> Permissions and allow all sites,\n"
-        "then test at https://webauthn.io (register/sign in, choose the phone/QR option).")
+    log_snapshot()
+    if not (extension_ready() and portal_credential_ready()):
+        say("\nNot everything is in place yet: see the unchecked items above and the log.")
+        return
+    say("\nEverything is installed and verified. On webauthn.io choose register/sign in, then the "
+        "phone/QR option and scan the code (the phone must be within BLE range of the ESP32 proxy).")
+    open_test_page()
 
 
 def main() -> None:
@@ -768,15 +928,26 @@ def main() -> None:
     sub.add_parser("install", help="apply everything that is missing").set_defaults(func=cmd_install)
     args = parser.parse_args()
     DRY_RUN = args.dry_run
+    log_path = init_log(args.cmd)
+    say(f"log file: {log_path}")
     try:
         args.func(args)
     except StepError as err:
-        sys.exit(f"\nstopped: {err}\nFix the cause and re-run `passkey-qr install`: finished actions are skipped.")
+        log_snapshot()
+        sys.exit(f"\nstopped: {err}\nFix the cause and re-run `passkey-qr install`: finished actions are skipped.\n"
+                 f"Full log: {log_path}")
     except subprocess.CalledProcessError as err:
+        log_snapshot()
         sys.exit(f"\ncommand failed (exit {err.returncode}): {' '.join(map(str, err.cmd))}\n"
-                 "Re-run `passkey-qr install` after fixing it: finished actions are skipped.")
+                 f"Re-run `passkey-qr install` after fixing it: finished actions are skipped.\nFull log: {log_path}")
     except (KeyboardInterrupt, EOFError):
+        log("aborted by user")
         sys.exit("\naborted")
+    except Exception:
+        import traceback
+        log(traceback.format_exc())
+        raise
+    say(f"\nlog file: {log_path}")
 
 
 if __name__ == "__main__":

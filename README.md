@@ -38,6 +38,17 @@ For step 3 you need a **long-lived access token of an admin Home Assistant
 user** (Profile -> Security); the installer asks for it and stores it in
 `~/.config/ha-ble-vhci/token` (mode 600).
 
+After the last step the installer reloads the user D-Bus/systemd services, restarts
+the portal, restarts Firefox (session restore brings the tabs back), waits until
+the extension is active with access to all sites, and offers to open
+https://webauthn.io. The policy-installed extension gets `<all_urls>` granted
+automatically (checked in an isolated Firefox 158 profile).
+
+Everything shown on screen, including all command output, is also written to
+`~/.local/state/passkey-qr/<timestamp>-<command>.log` (`latest.log` links to the
+last install run) together with a diagnostic snapshot at the end or on failure.
+Home Assistant tokens are never logged.
+
 ## Not supported
 
 * **Touch ID on the Apple Magic Keyboard.** The keyboard is only a sensor:
@@ -57,7 +68,7 @@ build on Ubuntu 26.04, and an actual phone scan. Report breakage as issues.
 
 ## Troubleshooting
 
-* `passkey-qr status` shows what is missing.
+* `passkey-qr status` shows what is missing; the log is `~/.local/state/passkey-qr/latest.log`.
 * Bridge: `journalctl --user -u ha-ble-vhci`; `bluetoothctl list`; after being
   added to `plugdev`, log out and in once.
 * After step 4 log out and in once (D-Bus/systemd activation files).
