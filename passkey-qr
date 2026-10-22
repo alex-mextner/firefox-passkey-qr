@@ -754,7 +754,12 @@ class Project:
 
 PROJECTS = [
     Project("credentialsd", CREDSD_REPO, CREDSD_TAG, True, False, ["-Dprefix=/usr/local"], "build-release"),
-    Project("xdg-desktop-portal", PORTAL_REPO, PORTAL_BRANCH, False, True, ["--prefix", "/usr/local"], "_build"),
+    # Ubuntu's libdex is built without gdbus support, which the portal fork requires
+    Project("libdex", "https://gitlab.gnome.org/GNOME/libdex.git", "1.2.0", True, False,
+            ["--prefix", "/usr/local", "-Dgdbus=enabled", "-Dexamples=false", "-Dtests=false", "-Dvapi=false",
+             "-Dintrospection=disabled", "-Dpygobject=false", "-Ddocs=false"], "_build"),
+    Project("xdg-desktop-portal", PORTAL_REPO, PORTAL_BRANCH, False, True,
+            ["--prefix", "/usr/local", "-Dtests=disabled", "-Ddocumentation=disabled", "-Dman-pages=disabled"], "_build"),
 ]
 
 
@@ -836,6 +841,10 @@ def restart_portal() -> None:
             time.sleep(1)
 
 
+def libdex_linked() -> bool:
+    return "/usr/local" in out(["sh", "-c", "ldconfig -p | grep 'libdex-1'"])
+
+
 def rust_channel() -> str | None:
     text = read_text(SRC_DIR / "credentialsd" / "rust-toolchain.toml") or ""
     match = re.search(r'^channel\s*=\s*"([^"]+)"', text, re.M)
@@ -882,6 +891,9 @@ def credentialsd_actions() -> list[Action]:
             Action(f"{p.name}: installed into /usr/local", lambda p=p: is_installed(p),
                    lambda p=p: run(["meson", "install", "-C", p.build_dir], cwd=p.path, sudo=True)),
         ]
+        if p.name == "libdex":
+            actions.append(Action("libdex from /usr/local is known to the dynamic linker",
+                                  libdex_linked, lambda: run(["ldconfig"], sudo=True)))
     actions.append(Action("xdg-desktop-portal: credential portal enabled (systemd user drop-in)",
                           lambda: read_text(PORTAL_DROPIN) == PORTAL_DROPIN_TEXT,
                           lambda: (write_file(PORTAL_DROPIN, PORTAL_DROPIN_TEXT),
