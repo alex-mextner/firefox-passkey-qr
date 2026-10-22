@@ -60,6 +60,10 @@ UDEV_RULE = Path("/etc/udev/rules.d/99-vhci.rules")
 UDEV_RULE_TEXT = 'KERNEL=="vhci", TAG+="uaccess", GROUP="plugdev", MODE="0660"\n'
 MODULES_CONF = Path("/etc/modules-load.d/hci_vhci.conf")
 FIREFOX_POLICIES = Path("/etc/firefox/policies/policies.json")
+BLUEPRINT_REPO = "https://gitlab.gnome.org/GNOME/blueprint-compiler.git"
+BLUEPRINT_TAG = "v0.20.4"
+BLUEPRINT_MIN = (0, 20, 4)  # credentialsd-ui requires >= 0.20.4, Ubuntu 26.04 ships 0.19
+LOCAL_BIN = HOME / ".local/bin"
 PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
 PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
@@ -70,6 +74,7 @@ APT_PACKAGES = [
     # credentialsd (udev.pc lives in systemd-dev, not in libudev-dev)
     "libgtk-4-dev", "libadwaita-1-dev", "libdbus-1-dev", "libnfc-dev", "libpcsclite-dev",
     "libssl-dev", "libudev-dev", "systemd-dev", "python3-dbus-next",
+    "python3-gi", "gir1.2-gtk-4.0", "gir1.2-adw-1",  # needed by blueprint-compiler
     # patched xdg-desktop-portal
     "libdex-dev", "libfuse3-dev", "libgdk-pixbuf-2.0-dev", "libgstreamer-plugins-base1.0-dev",
     "libpipewire-0.3-dev", "libwireplumber-0.5-dev", "libsystemd-dev", "libgudev-1.0-dev",
@@ -276,6 +281,7 @@ DEP_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'ERROR: Dependency "([^"]+)" not found'), "pc"),
     (re.compile(r"Package '?([\w.+-]+)'? was not found in the pkg-config search path"), "pc"),
     (re.compile(r"The system library `([\w.+-]+)` required by crate"), "pc"),
+    (re.compile(r"Program ([\w.+-]+) found: NO found [\d.]+ but need"), "tool"),
     (re.compile(r"ERROR: Program '([^']+)' not found"), "bin"),
     (re.compile(r"fatal error: ([\w./+-]+\.h): No such file or directory"), "hdr"),
 ]
@@ -319,6 +325,39 @@ def resolve_packages(missing: list[tuple[str, str]]) -> list[str]:
     return pkgs
 
 
+def version_of(tool: str) -> tuple[int, ...]:
+    match = re.search(r"(\d+(?:\.\d+)+)", out([tool, "--version"]))
+    return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+
+def ensure_local_bin_on_path() -> None:
+    if str(LOCAL_BIN) not in os.environ.get("PATH", "").split(":")[:1]:
+        os.environ["PATH"] = f"{LOCAL_BIN}:{os.environ.get('PATH', '')}"
+
+
+def blueprint_ok() -> bool:
+    ensure_local_bin_on_path()
+    return version_of("blueprint-compiler") >= BLUEPRINT_MIN
+
+
+def build_blueprint() -> None:
+    """Ubuntu's blueprint-compiler is too old for credentialsd-ui: build the pinned release into ~/.local."""
+    src = SRC_DIR / "blueprint-compiler"
+    if (src / ".git").exists():
+        run(["git", "-C", str(src), "fetch", "--tags", "origin"])
+    else:
+        src.parent.mkdir(parents=True, exist_ok=True) if not DRY_RUN else None
+        run(["git", "clone", BLUEPRINT_REPO, str(src)])
+    run(["git", "-C", str(src), "checkout", BLUEPRINT_TAG])
+    run_resolving(["meson", "setup", "_build", "--prefix", str(HOME / ".local"), "--reconfigure"], src)
+    run_resolving(["meson", "compile", "-C", "_build"], src)
+    run(["meson", "install", "-C", "_build"], cwd=src)  # user prefix: no sudo
+    ensure_local_bin_on_path()
+
+
+SOURCE_BUILDERS: dict[str, Callable[[], None]] = {"blueprint-compiler": build_blueprint}
+
+
 def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
     """Run a build command; when it fails on a missing dependency, install it and retry."""
     tried: set[str] = set()
@@ -326,8 +365,17 @@ def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
         rc, text = run_stream(cmd, cwd=cwd)
         if rc == 0:
             return
+        missing = find_missing(text)
+        wanted = [name for _, name in missing if name in SOURCE_BUILDERS and name not in tried]
+        if wanted:  # tools Ubuntu ships too old: build the pinned release instead of apt
+            if not confirm(f"{', '.join(wanted)} must be built from source into ~/.local (Ubuntu's is too old). Do it?"):
+                raise StepError("source-built tool declined")
+            for name in wanted:
+                SOURCE_BUILDERS[name]()
+                tried.add(name)
+            continue
         have = installed_apt()
-        pkgs = [p for p in resolve_packages(find_missing(text)) if p not in have]
+        pkgs = [p for p in resolve_packages([m for m in missing if m[1] not in SOURCE_BUILDERS]) if p not in have]
         if not pkgs or set(pkgs) <= tried:
             tail = "\n".join(text.splitlines()[-15:])
             raise StepError(f"`{' '.join(cmd)}` failed and no installable dependency could be identified:\n{tail}")
@@ -778,7 +826,10 @@ def restart_portal() -> None:
 
 
 def credentialsd_actions() -> list[Action]:
-    actions: list[Action] = []
+    actions: list[Action] = [
+        Action(f"blueprint-compiler >= {'.'.join(map(str, BLUEPRINT_MIN))} (built into ~/.local; Ubuntu ships 0.19)",
+               blueprint_ok, build_blueprint),
+    ]
     for p in PROJECTS:
         actions += [
             Action(f"{p.name}: source at {p.ref}" + (" with submodules" if p.recurse else ""),
