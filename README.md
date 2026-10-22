@@ -18,6 +18,7 @@ automatically, after a confirmation:
 | 3 | **Only if the PC has no Bluetooth and Home Assistant is reachable:** installs [ha-ble-vhci](https://github.com/alex-mextner/ha-ble-vhci) | the QR flow requires the PC to *hear the phone's BLE advertisement*; ha-ble-vhci gets those from your ESPHome Bluetooth proxy through Home Assistant and presents them to BlueZ as a local adapter |
 | 4 | builds [credentialsd](https://github.com/linux-credentials/credentialsd) + its patched `xdg-desktop-portal` into `/usr/local` | the credential manager that implements hybrid on Linux |
 | 5 | native-messaging link + a Firefox policy (`/etc/firefox/policies/policies.json`, `normal_installed`) that installs the Mozilla-signed `credentialsd-helper` extension on next start (you can still disable it) | intercepts `navigator.credentials` in Firefox and shows the phone/USB chooser |
+| 6 | **self-healing**, user space only: systemd drop-ins, a health-check timer and a Firefox-prefs path unit (below) | every link of the chain restarts and repairs itself; an offline Bluetooth proxy is announced on the desktop instead of a silently hanging QR window |
 
 If the PC has a real Bluetooth adapter, step 3 does nothing. If it has neither
 Bluetooth nor Home Assistant, the installer tells you to get a USB BLE dongle.
@@ -88,6 +89,40 @@ Everything shown on screen during `install`, including all command output, is al
 `~/.local/state/passkey-qr/<timestamp>-install.log` (`latest.log` links to the
 last run) together with a diagnostic snapshot at the end or on failure.
 Home Assistant tokens are never logged.
+
+## Self-healing (step 6)
+
+`passkey-qr install` (step 6, a required row of `check`/`status`, no root) installs:
+
+* **Restart policy** - a drop-in `~/.config/systemd/user/<unit>.service.d/99-passkey-qr-selfheal.conf`
+  (named to sort last, so no other drop-in's `Restart=` wins)
+  (`Restart=always`, `StartLimitIntervalSec=0`, `RestartSec=2..5`) for `ha-ble-vhci`, `xdg-desktop-portal`,
+  `xyz.iinuwa.credentialsd.Credentials`, `xyz.iinuwa.credentialsd.UiControl` and `passwords-appd` (a unit that
+  is not installed is skipped). A killed or crashed service is back within seconds, however often it dies.
+  A `RestartPreventExitStatus=` from another drop-in still wins: `passwords-appd` keeps `=1` on purpose, because
+  its exit 1 now only means "the bus name is already owned" (another instance is alive) and restarting would
+  only fight it; unreadable data or a locked keyring exit 75 and are retried.
+* **Health check** - `passkey-qr-health.timer` runs `passkey-qr health` every 45 s from a copy of the installer in
+  `~/.local/libexec/passkey-qr/` (`install` refreshes it after you update the checkout; a stale copy does not fail `check`). It
+  starts `ha-ble-vhci` if it is stopped and restarts it when it registered no adapter or says "no scanner" while
+  Home Assistant sees one; powers on an unpowered adapter; restarts `xdg-desktop-portal` if it does not offer
+  `org.freedesktop.portal.experimental.Credential`; starts `credentialsd`/`credentialsd-ui` on demand (restart
+  when that fails); and **ends a stuck request**: a `credentialsd-firefox-helper` process (one per WebAuthn
+  request, it ignores SIGTERM when its request hangs) older than 10 minutes gets SIGKILL by pid and credentialsd
+  + its UI are restarted (deferred while another, younger request is still running, so it is never aborted),
+  because an abandoned request leaves credentialsd scanning forever. Restarts of the portal and of
+  credentialsd that did not help are retried at most every 5 minutes.
+* **Offline proxy signal** - when `ha-ble-vhci --scanners` exits 4 (no Bluetooth proxy online) or 1 (Home
+  Assistant unreachable) in two consecutive runs you get **one** critical desktop notification
+  (`notify-send`), repeated at most hourly while the outage lasts, and a "back online" notification when it
+  ends; an outage within 10 minutes of a recovery is a flap and stays in the journal. Everything is logged:
+  `journalctl --user -u passkey-qr-health`. State: `~/.local/state/passkey-qr/health.json`.
+* **Firefox prefs** - `passkey-qr-prefs.path` watches `~/.mozilla/firefox/profiles.ini` and `installs.ini`
+  (and `passkey-qr-prefs.service` also runs at login); `passkey-qr heal-prefs` re-applies only the managed
+  `user.js` block when a Firefox update or a new profile dropped it, logs the drift and sends a notification.
+
+Test seams: `PASSKEY_QR_STUCK_SECONDS` (age limit), `PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT` (pretend the
+`--scanners` exit code, e.g. `4`, to see the notification path).
 
 ## Not supported
 
