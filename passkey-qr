@@ -30,11 +30,12 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NoReturn
 
 HOME = Path.home()
 SRC_DIR = Path(os.environ.get("PASSKEY_QR_SRC", HOME / "dev")).expanduser()
@@ -42,7 +43,7 @@ CACHE_DIR = HOME / ".cache/passkey-qr"
 BRIDGE_REPO = os.environ.get("PASSKEY_QR_BRIDGE_REPO", "https://github.com/alex-mextner/ha-ble-vhci")
 BRIDGE_DIR = HOME / ".local/share/ha-ble-vhci"
 BRIDGE_CFG = HOME / ".config/ha-ble-vhci"
-BRIDGE_VERSION = "0.1.1"
+BRIDGE_VERSION = "0.1.5"
 BRIDGE_UNIT = HOME / ".config/systemd/user/ha-ble-vhci.service"
 CREDSD_REPO = "https://github.com/linux-credentials/credentialsd"
 CREDSD_TAG = "v0.3.1"
@@ -60,16 +61,27 @@ UDEV_RULE = Path("/etc/udev/rules.d/99-vhci.rules")
 UDEV_RULE_TEXT = 'KERNEL=="vhci", TAG+="uaccess", GROUP="plugdev", MODE="0660"\n'
 MODULES_CONF = Path("/etc/modules-load.d/hci_vhci.conf")
 FIREFOX_POLICIES = Path("/etc/firefox/policies/policies.json")
+BLUEPRINT_REPO = "https://gitlab.gnome.org/GNOME/blueprint-compiler.git"
+BLUEPRINT_TAG = "v0.20.4"
+BLUEPRINT_MIN = (0, 20, 4)  # credentialsd-ui requires >= 0.20.4, Ubuntu 26.04 ships 0.19
+LOCAL_BIN = HOME / ".local/bin"
+CARGO_BIN = Path(os.environ.get("CARGO_HOME", HOME / ".cargo")) / "bin"  # where rustup puts cargo
+PORTAL_CONF = HOME / ".config/xdg-desktop-portal/portals.conf"
+CREDENTIAL_IMPL_IFACE = "org.freedesktop.impl.portal.experimental.Credential"
+FIREFOX_APP_ID = "org.mozilla.firefox"  # app id the credentialsd helper registers with the portal
+APP_DESKTOP = HOME / ".local/share/applications/org.mozilla.firefox.desktop"
 PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
 PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
 APT_PACKAGES = [
     # toolchain
-    "build-essential", "git", "curl", "rsync", "zip", "meson", "ninja-build", "pkg-config",
-    "rustc", "cargo", "gettext", "blueprint-compiler",
+    "build-essential", "git", "curl", "ca-certificates", "rsync", "zip", "meson", "ninja-build", "pkg-config",
+    "gettext",  # no rustc/cargo: credentialsd pins a newer Rust than Ubuntu ships, so rustup provides it
     # credentialsd (udev.pc lives in systemd-dev, not in libudev-dev)
     "libgtk-4-dev", "libadwaita-1-dev", "libdbus-1-dev", "libnfc-dev", "libpcsclite-dev",
     "libssl-dev", "libudev-dev", "systemd-dev", "python3-dbus-next",
+    "python3-gi", "gir1.2-gtk-4.0", "gir1.2-adw-1",  # needed by blueprint-compiler
+    "libclang-dev", "libxml2-utils",  # bindgen (nfc1-sys) needs clang headers; gresource needs xmllint
     # patched xdg-desktop-portal
     "libdex-dev", "libfuse3-dev", "libgdk-pixbuf-2.0-dev", "libgstreamer-plugins-base1.0-dev",
     "libpipewire-0.3-dev", "libwireplumber-0.5-dev", "libsystemd-dev", "libgudev-1.0-dev",
@@ -79,7 +91,10 @@ APT_PACKAGES = [
 ]
 
 # pkg-config / program names whose apt package is not found by the obvious name.
-PKG_OVERRIDES = {"udev": "systemd-dev", "systemd": "systemd-dev", "ssl": "libssl-dev"}
+PKG_OVERRIDES = {"udev": "systemd-dev", "systemd": "systemd-dev", "ssl": "libssl-dev",
+                 "xmllint": "libxml2-utils", "stdbool.h": "libclang-dev"}
+
+ERROR_LINE = re.compile(r"error|ERROR|FAILED|panicked|not found")  # what a failed build's excerpt keeps
 
 DRY_RUN = False
 ASSUME_YES = False
@@ -91,9 +106,64 @@ class StepError(Exception):
     pass
 
 
+class NeedsYou(Exception):
+    """An unattended (--yes) run cannot go on with this step without a person (a Home Assistant token,
+    Firefox closed). The rest of the step is skipped, the other steps still run, and `install` ends
+    with exit code 3 and the list of what is waiting for you."""
+
+
+NOTES: list[str] = []  # what is waiting for a person, printed at the end of `install`
+
+
+def blocked(message: str) -> NoReturn:
+    """Stop this step: an unattended (--yes) run waits for a person (exit 3), an interactive one fails."""
+    if ASSUME_YES:
+        raise NeedsYou(message)
+    raise StepError(message)
+
+
 # --------------------------------------------------------------------------- helpers
+STATE_DIR = Path(os.environ.get("PASSKEY_QR_STATE", HOME / ".local/state/passkey-qr"))
+LOG_FILE = None  # opened by init_log()
+
+
+def init_log(command: str) -> Path | None:
+    """Mirror everything shown on screen (and all command output) into a log file."""
+    global LOG_FILE
+    path = STATE_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{command}-{os.getpid()}.log"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        LOG_FILE = open(path, "a", buffering=1)
+        if command == "install":  # latest.log always points to the last install run
+            latest = STATE_DIR / "latest.log"
+            latest.unlink(missing_ok=True)
+            try:
+                latest.symlink_to(path.name)
+            except FileExistsError:  # another install started at the same moment: its link wins
+                pass
+    except OSError as err:
+        print(f"warning: no log file ({err}); continuing without one", file=sys.stderr)
+        LOG_FILE = None
+        return None
+    log(f"passkey-qr {command} started {time.strftime('%Y-%m-%d %H:%M:%S')} dry_run={DRY_RUN} user={getpass.getuser()}")
+    return path
+
+
+def log(text: str) -> None:
+    if LOG_FILE:
+        LOG_FILE.write(text if text.endswith("\n") else text + "\n")
+
+
 def say(msg: str = "") -> None:
     print(msg, flush=True)
+    log(msg)
+
+
+def ask(prompt: str) -> str:
+    log(f"{prompt}<waiting for input>")
+    answer = input(prompt)
+    log(f"  -> {answer!r}")
+    return answer
 
 
 def confirm(question: str, *, destructive: bool = False) -> bool:
@@ -109,7 +179,7 @@ def confirm(question: str, *, destructive: bool = False) -> bool:
         say(f"? {question} [auto-yes in dry-run]")
         return True
     while True:
-        answer = input(f"? {question} [y/N] ").strip().lower()
+        answer = ask(f"? {question} [y/N] ").strip().lower()
         if answer in ("y", "yes"):
             return True
         if answer in ("", "n", "no"):
@@ -123,28 +193,38 @@ def _argv(cmd: list[str] | str, sudo: bool) -> list[str]:
     return argv
 
 
-def run(cmd: list[str] | str, *, sudo: bool = False, cwd: Path | None = None,
-        check: bool = True) -> subprocess.CompletedProcess:
-    argv = _argv(cmd, sudo)
-    say("  $ " + " ".join(shlex.quote(a) for a in argv))
-    if DRY_RUN:
-        return subprocess.CompletedProcess(argv, 0, "", "")
-    return subprocess.run(argv, cwd=cwd, check=check, text=True)
-
-
 def run_stream(cmd: list[str] | str, *, cwd: Path | None = None, sudo: bool = False) -> tuple[int, str]:
-    """Run a command, echo its output live and also return it."""
+    """Run a command, echo its output live (screen and log) and also return it."""
     argv = _argv(cmd, sudo)
     say("  $ " + " ".join(shlex.quote(a) for a in argv))
     if DRY_RUN:
         return 0, ""
-    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    started = time.time()
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                errors="replace")
+    except OSError as err:  # a missing binary is a failed step with a log, not a traceback
+        raise StepError(f"cannot run {argv[0]}: {err.strerror or err}") from err
     lines: list[str] = []
     assert proc.stdout
     for line in proc.stdout:
         sys.stdout.write(line)
+        log(line)
         lines.append(line)
-    return proc.wait(), "".join(lines)
+    rc = proc.wait()
+    log(f"  [exit {rc} after {time.time() - started:.1f}s]")
+    return rc, "".join(lines)
+
+
+def run(cmd: list[str] | str, *, sudo: bool = False, cwd: Path | None = None,
+        check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command, echo its output live and into the log (so the child sees a pipe, not a terminal:
+    apt/meson progress bars are plain text; sudo still asks for its password on /dev/tty)."""
+    argv = _argv(cmd, sudo)
+    rc, text = run_stream(cmd, cwd=cwd, sudo=sudo)
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, argv, output=text)
+    return subprocess.CompletedProcess(argv, rc, text, "")
 
 
 def out(cmd: list[str], timeout: float = 20) -> str:
@@ -195,7 +275,9 @@ class Action:
     apply: Callable[[], None]
     optional: bool = False  # confirmed separately; skipping it is not a failure
     destructive: bool = False  # with --yes it additionally needs --remove-snap
-    hint: str = ""          # shown if the check still fails after apply
+    required: bool = True   # False: context only; `check` ignores it and a failed re-check is not an error
+    needs_relogin: bool = False  # under --yes a failed re-check waits for a new login (exit 3), not exit 1
+    hint: str | Callable[[], str] = ""  # shown if the check still fails after apply (lazy when a callable)
 
 
 def show_actions(actions: list[Action]) -> list[Action]:
@@ -226,9 +308,22 @@ def run_actions(title: str, actions: list[Action], intro: str = "") -> bool:
             say(f"  skipped: {action.name}")
             continue
         say(f"-> {action.name}")
-        action.apply()
+        try:
+            action.apply()
+        except NeedsYou as note:
+            NOTES.append(f"{title}: {note}")
+            say(f"  needs you: {note}")
+            return False  # the later actions of this step depend on this one; other steps still run
         if not DRY_RUN and not action.check():
-            raise StepError(f"'{action.name}' was applied but the check still fails. {action.hint}".strip())
+            hint = (action.hint() if callable(action.hint) else action.hint) or action.name
+            if not action.required:
+                say(f"  note: {action.name}: {hint}")
+                continue
+            if ASSUME_YES and action.needs_relogin:
+                NOTES.append(f"{title}: {hint}")
+                say(f"  needs you: {hint}")
+                return False
+            raise StepError(f"'{action.name}' was applied but the check still fails. {hint}".strip())
     return True
 
 
@@ -243,8 +338,14 @@ def missing_apt() -> list[str]:
     return [p for p in APT_PACKAGES if p not in have]
 
 
+APT_QUIET = ["env", "DEBIAN_FRONTEND=noninteractive"]  # sudo drops the caller's environment: set it after sudo
+APT_CONF = ["-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"]
+
+
 def apt_install(pkgs: list[str], extra: list[str] | None = None) -> None:
-    run(["apt-get", "install", "-y", *(extra or []), *pkgs], sudo=True)
+    """apt output goes through a pipe (see `run`), so a dpkg/debconf question without a newline would be
+    invisible and look like a hang: answer them with the defaults instead."""
+    run([*APT_QUIET, "apt-get", "install", "-y", *APT_CONF, *(extra or []), *pkgs], sudo=True)
 
 
 # ----------------------------------------------------- automatic build-dependency fixing
@@ -252,8 +353,11 @@ DEP_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r'ERROR: Dependency "([^"]+)" not found'), "pc"),
     (re.compile(r"Package '?([\w.+-]+)'? was not found in the pkg-config search path"), "pc"),
     (re.compile(r"The system library `([\w.+-]+)` required by crate"), "pc"),
+    (re.compile(r"Program ([\w.+-]+) found: NO found [\d.]+ but need"), "tool"),
     (re.compile(r"ERROR: Program '([^']+)' not found"), "bin"),
     (re.compile(r"fatal error: ([\w./+-]+\.h): No such file or directory"), "hdr"),
+    (re.compile(r"fatal error: '([\w./+-]+\.h)' file not found"), "hdr"),
+    (re.compile(r"\b([\w.+-]+) is not in PATH"), "bin"),
 ]
 
 
@@ -281,6 +385,9 @@ def apt_file_search(regex: str) -> list[str]:
 def resolve_packages(missing: list[tuple[str, str]]) -> list[str]:
     pkgs: list[str] = []
     for kind, name in missing:
+        if name in ("cargo", "rustc") and kind in ("bin", "tool"):
+            say(f"  '{name}' comes from rustup (the credentialsd step), not from apt")
+            continue
         if name in PKG_OVERRIDES:
             found = [PKG_OVERRIDES[name]]
         elif kind == "pc":
@@ -295,6 +402,42 @@ def resolve_packages(missing: list[tuple[str, str]]) -> list[str]:
     return pkgs
 
 
+def version_of(tool: str) -> tuple[int, ...]:
+    match = re.search(r"(\d+(?:\.\d+)+)", out([tool, "--version"]))
+    return tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+
+def ensure_local_bin_on_path() -> None:
+    """~/.cargo/bin (rustup's cargo) and ~/.local/bin (blueprint-compiler) first, once, in that order."""
+    wanted = [str(CARGO_BIN), str(LOCAL_BIN)]
+    rest = [p for p in os.environ.get("PATH", "").split(":") if p and p not in wanted]
+    os.environ["PATH"] = ":".join(wanted + rest)
+
+
+def blueprint_ok() -> bool:
+    ensure_local_bin_on_path()
+    return version_of("blueprint-compiler") >= BLUEPRINT_MIN
+
+
+def build_blueprint() -> None:
+    """Ubuntu's blueprint-compiler is too old for credentialsd-ui: build the pinned release into ~/.local."""
+    src = SRC_DIR / "blueprint-compiler"
+    if (src / ".git").exists():
+        run(["git", "-C", str(src), "fetch", "--tags", "origin"])
+    else:
+        if not DRY_RUN:
+            src.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "clone", BLUEPRINT_REPO, str(src)])
+    run(["git", "-C", str(src), "checkout", BLUEPRINT_TAG])
+    run_resolving(["meson", "setup", "_build", "--prefix", str(HOME / ".local"), "--reconfigure"], src)
+    run_resolving(["meson", "compile", "-C", "_build"], src)
+    run(["meson", "install", "-C", "_build"], cwd=src)  # user prefix: no sudo
+    ensure_local_bin_on_path()
+
+
+SOURCE_BUILDERS: dict[str, Callable[[], None]] = {"blueprint-compiler": build_blueprint}
+
+
 def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
     """Run a build command; when it fails on a missing dependency, install it and retry."""
     tried: set[str] = set()
@@ -302,10 +445,21 @@ def run_resolving(cmd: list[str], cwd: Path, rounds: int = 30) -> None:
         rc, text = run_stream(cmd, cwd=cwd)
         if rc == 0:
             return
+        missing = find_missing(text)
+        wanted = [name for _, name in missing if name in SOURCE_BUILDERS and name not in tried]
+        if wanted:  # tools Ubuntu ships too old: build the pinned release instead of apt
+            if not confirm(f"{', '.join(wanted)} must be built from source into ~/.local (Ubuntu's is too old). Do it?"):
+                raise StepError("source-built tool declined")
+            for name in wanted:
+                SOURCE_BUILDERS[name]()
+                tried.add(name)
+            continue
         have = installed_apt()
-        pkgs = [p for p in resolve_packages(find_missing(text)) if p not in have]
+        pkgs = [p for p in resolve_packages([m for m in missing if m[1] not in SOURCE_BUILDERS]) if p not in have]
         if not pkgs or set(pkgs) <= tried:
-            tail = "\n".join(text.splitlines()[-15:])
+            lines = text.splitlines()
+            errs = [line for line in lines if ERROR_LINE.search(line)][:25]
+            tail = "\n".join(errs + ["...", *lines[-8:]])
             raise StepError(f"`{' '.join(cmd)}` failed and no installable dependency could be identified:\n{tail}")
         if not confirm(f"Install the missing build dependencies ({' '.join(pkgs)}) with apt?"):
             raise StepError("build dependencies not installed")
@@ -414,6 +568,11 @@ def ha_token() -> str | None:
     return os.environ.get("HA_TOKEN", "").strip() or (read_text(BRIDGE_CFG / "token") or "").strip() or None
 
 
+def _hidden(prompt: str) -> str:
+    log(f"{prompt}<hidden input, not logged>")
+    return getpass.getpass(prompt).strip()
+
+
 def configure_ha() -> None:
     url = ha_url_configured()
     stored = (read_text(BRIDGE_CFG / "token") or "").strip()
@@ -425,25 +584,28 @@ def configure_ha() -> None:
         if found and confirm(f"Use Home Assistant at {found[0]}?"):
             url = found[0]
         elif not DRY_RUN and not ASSUME_YES:
-            url = input("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to abort: ").strip().rstrip("/")
+            url = ask("  Home Assistant URL (e.g. http://100.x.y.z:8123), Enter to abort: ").strip().rstrip("/")
         if not url:
-            raise StepError("No Home Assistant configured: plug in a USB Bluetooth (BLE) dongle instead.")
+            blocked("No Bluetooth adapter and no Home Assistant found: plug in a USB Bluetooth (BLE) dongle, "
+                    "or set HA_URL and HA_TOKEN and re-run")
         rejected = False
     else:
         rejected = bool(stored)
-    if ASSUME_YES:
+    if ASSUME_YES and DRY_RUN:
+        token = "dry-run-token"  # the listing never asks for or prints a token
+    elif ASSUME_YES:
         token = ha_token()
         if rejected and token == stored:
             token = None  # the stored token was just rejected; only a fresh $HA_TOKEN can fix it
         if not token:
-            raise StepError(f"--yes cannot ask for a token: put a valid one in $HA_TOKEN "
-                            f"(or {BRIDGE_CFG / 'token'}) and re-run")
+            raise NeedsYou(f"Home Assistant at {url} needs a long-lived admin token: put it in $HA_TOKEN "
+                           f"(or {BRIDGE_CFG / 'token'}) and re-run")
         say("  using the token from $HA_TOKEN or the token file; it is never printed")
     else:
         if rejected:
             say(f"  the stored token for {url} was rejected; enter a new one")
         say(f"  Create a long-lived token of an admin user: {url}/profile/security -> Long-lived access tokens")
-        token = "dry-run-token" if DRY_RUN else getpass.getpass("  Paste the token (hidden, Enter to abort): ").strip()
+        token = "dry-run-token" if DRY_RUN else _hidden("  Paste the token (hidden, Enter to abort): ")
     if not token:
         raise StepError("no token given")
     write_file(BRIDGE_CFG / "token", token + "\n", 0o600)
@@ -451,6 +613,8 @@ def configure_ha() -> None:
 
 
 def adapter_appears() -> None:
+    if DRY_RUN:
+        return
     for attempt in range(2):
         for _ in range(15):
             if virtual_adapter():
@@ -538,19 +702,156 @@ def install_mozilla_repo() -> None:
     run(["apt-get", "update"], sudo=True)
 
 
+def need_firefox_closed() -> None:
+    if firefox_running() and ASSUME_YES:  # also in --dry-run: the preview must show what the real run waits for
+        raise NeedsYou("Firefox is running and --yes cannot ask you to close it: close it and re-run")
+    if DRY_RUN:
+        return
+    while firefox_running():
+        ask("  Close Firefox completely, then press Enter... ")
+
+
 def copy_profile() -> None:
     prof = snap_profile()
     assert prof
-    if firefox_running() and ASSUME_YES and not DRY_RUN:
-        raise StepError("Firefox is running and --yes cannot ask you to close it: close it and re-run")
-    while firefox_running() and not DRY_RUN:
-        input("  Close Firefox completely, then press Enter... ")
+    need_firefox_closed()
     run(["rsync", "-a", f"{prof}/", f"{MOZ_PROFILE / prof.name}/"])
+    if not DRY_RUN:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        MIGRATED_NOTE.write_text(prof.name + "\n")
     if not (MOZ_PROFILE / "profiles.ini").exists():
         run(["cp", str(SNAP_PROFILE / "profiles.ini"), str(MOZ_PROFILE / "profiles.ini")])
     if not DRY_RUN:
         for lock in ("lock", ".parentlock"):
             (MOZ_PROFILE / prof.name / lock).unlink(missing_ok=True)
+
+
+def read_ini(path: Path) -> configparser.RawConfigParser:
+    """Tolerant read for checks: a missing or unparsable file is just empty."""
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str  # keep key case (Name, Path, Default, Locked)
+    try:
+        cp.read(path)
+    except configparser.Error:
+        return configparser.RawConfigParser()
+    return cp
+
+
+def read_ini_for_edit(path: Path) -> configparser.RawConfigParser:
+    """Strict read before rewriting a user's file: never overwrite what cannot be parsed."""
+    cp = configparser.RawConfigParser()
+    cp.optionxform = str
+    try:
+        cp.read(path)
+    except configparser.Error as err:
+        raise StepError(f"{path} cannot be parsed ({err}); fix it by hand, nothing was changed") from err
+    return cp
+
+
+def write_ini(cp: configparser.RawConfigParser, path: Path) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        cp.write(handle, space_around_delimiters=False)
+
+
+# Firefox names an install by a hash of its directory. Mozilla's deb lives in /usr/lib/firefox, so the hash is the
+# same on every machine (it is also what the deb wrote on the first one). Seeding this section is how the
+# deb adopts the migrated profile at its very first start, with no Firefox launched by the installer.
+DEB_INSTALL_HASH = "4F96D1932A9F858E"
+
+
+def install_default_name() -> str | None:
+    """The profile the deb Firefox starts: its own section of installs.ini, else of profiles.ini. Other
+    installs' sections (the snap's stale one, ESR, ...) say nothing about it."""
+    inst = read_ini(MOZ_PROFILE / "installs.ini")
+    if inst.has_option(DEB_INSTALL_HASH, "Default"):
+        return inst.get(DEB_INSTALL_HASH, "Default")
+    cp = read_ini(MOZ_PROFILE / "profiles.ini")
+    return cp.get(f"Install{DEB_INSTALL_HASH}", "Default", fallback=None)
+
+
+def active_profile() -> Path | None:
+    name = install_default_name()
+    return MOZ_PROFILE / name if name else None
+
+
+MIGRATED_NOTE = STATE_DIR / "migrated-profile"
+SWITCHED_NOTE = STATE_DIR / "profile-switched"  # written once the start profile was switched
+
+
+def migrated_name() -> str | None:
+    """Name of the profile copied from the snap, or None when there was no migration. Only evidence of
+    one counts (the note written by the copy, or the snap's own profile): a legacy `Default=1` profile of
+    a stock Firefox is not a migrated one."""
+    snap = snap_profile()
+    if snap:  # the source exists, so the copy is (or is about to be) made by the action before this one
+        return snap.name
+    try:
+        note = MIGRATED_NOTE.read_text().strip()
+    except OSError:
+        return None
+    return note if note and (MOZ_PROFILE / note / "prefs.js").exists() else None
+
+
+def migrated_is_default() -> bool:
+    """True when there is nothing to switch, or the switch was done: after it, a different default is the
+    user's own choice in about:profiles and is neither drift nor reverted."""
+    name = migrated_name()
+    return name is None or install_default_name() == name or SWITCHED_NOTE.exists()
+
+
+def _seed_install(cp: configparser.RawConfigParser, section: str, name: str) -> None:
+    if not cp.has_section(section):
+        cp.add_section(section)
+    cp.set(section, "Default", name)
+    cp.set(section, "Locked", "1")
+
+
+def set_install_default() -> None:
+    """Make the migrated snap profile the one the deb Firefox starts: by its own install section, written
+    before its first start or switched after it created a fresh, locked profile. Other installs' sections
+    are left alone."""
+    name = migrated_name()
+    assert name
+    need_firefox_closed()
+    if not DRY_RUN and not (MOZ_PROFILE / name / "prefs.js").exists():
+        # e.g. the copy was declined in an interactive run: never point Firefox at a directory that is not there
+        raise StepError(f"the profile {name} was not copied to {MOZ_PROFILE}: copy it first (answer yes to "
+                        "'snap profile copied') and re-run")
+    say(f"  start profile: {install_default_name() or '(not started yet)'} -> {name} "
+        "(backups: *.bak-passkey-qr; a fresh profile is kept, nothing is deleted)")
+    if DRY_RUN:
+        return
+    cp = read_ini_for_edit(MOZ_PROFILE / "profiles.ini")
+    inst = read_ini_for_edit(MOZ_PROFILE / "installs.ini")
+    for fname in ("profiles.ini", "installs.ini"):
+        path = MOZ_PROFILE / fname
+        backup = path.with_name(fname + ".bak-passkey-qr")
+        if path.exists() and not backup.exists():  # the first backup is the user's original, keep it
+            shutil.copy2(path, backup)
+    if not cp.has_section("General"):
+        cp.add_section("General")
+        cp.set("General", "StartWithLastProfile", "1")
+        cp.set("General", "Version", "2")
+    if not any(cp.get(sec, "Path", fallback="") == name for sec in cp.sections()):
+        index = 0
+        while cp.has_section(f"Profile{index}"):
+            index += 1
+        cp.add_section(f"Profile{index}")
+        for key, value in (("Name", "migrated"), ("IsRelative", "1"), ("Path", name)):
+            cp.set(f"Profile{index}", key, value)
+    for sec in cp.sections():
+        if sec.startswith("Profile"):
+            if cp.get(sec, "Path", fallback="") == name:
+                cp.set(sec, "Default", "1")
+            elif cp.has_option(sec, "Default"):
+                cp.remove_option(sec, "Default")
+    _seed_install(cp, f"Install{DEB_INSTALL_HASH}", name)
+    _seed_install(inst, DEB_INSTALL_HASH, name)
+    MOZ_PROFILE.mkdir(parents=True, exist_ok=True)
+    write_ini(cp, MOZ_PROFILE / "profiles.ini")
+    write_ini(inst, MOZ_PROFILE / "installs.ini")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SWITCHED_NOTE.write_text(name + "\n")
 
 
 def firefox_actions() -> list[Action]:
@@ -561,6 +862,8 @@ def firefox_actions() -> list[Action]:
                # Ubuntu's transitional package has epoch 1:, so Mozilla's deb counts as a downgrade
                lambda: apt_install(["firefox"], extra=["--allow-downgrades"])),
         Action("snap profile copied to ~/.mozilla/firefox", profile_copied, copy_profile),
+        Action("your migrated profile is the one Firefox starts (deb Firefox made a fresh one)",
+               migrated_is_default, set_install_default),
         Action("Firefox snap removed (snapd keeps an automatic snapshot)", lambda: not snap_firefox_present(),
                lambda: run(["snap", "remove", "firefox"], sudo=True), optional=True, destructive=True),
     ]
@@ -588,7 +891,12 @@ class Project:
 
 PROJECTS = [
     Project("credentialsd", CREDSD_REPO, CREDSD_TAG, True, False, ["-Dprefix=/usr/local"], "build-release"),
-    Project("xdg-desktop-portal", PORTAL_REPO, PORTAL_BRANCH, False, True, ["--prefix", "/usr/local"], "_build"),
+    # Ubuntu's libdex is built without gdbus support, which the portal fork requires
+    Project("libdex", "https://gitlab.gnome.org/GNOME/libdex.git", "1.2.0", True, False,
+            ["--prefix", "/usr/local", "-Dgdbus=enabled", "-Dexamples=false", "-Dtests=false", "-Dvapi=false",
+             "-Dintrospection=disabled", "-Dpygobject=false", "-Ddocs=false"], "_build"),
+    Project("xdg-desktop-portal", PORTAL_REPO, PORTAL_BRANCH, False, True,
+            ["--prefix", "/usr/local", "-Dtests=disabled", "-Ddocumentation=disabled", "-Dman-pages=disabled"], "_build"),
 ]
 
 
@@ -637,26 +945,178 @@ def is_built(p: Project) -> bool:
     return bool(files) and all(os.path.lexists(src) for src in files if src.startswith(str(p.build)))
 
 
+def install_project(p: Project) -> None:
+    """Install what was built. --no-rebuild: otherwise root re-runs the always-stale cargo/ninja
+    targets with root's toolchain and leaves root-owned files in the user's build directory."""
+    run(["meson", "install", "-C", p.build_dir, "--no-rebuild"], cwd=p.path, sudo=True)
+    owner = f"{os.getuid()}:{os.getgid()}"
+    run(["chown", "-R", owner, str(p.build)], sudo=True)  # undo any root-owned leftovers
+
+
+def libdex_gdbus_ready() -> bool:
+    return bool(out(["pkg-config", "--variable=gdbus_codegen_extension", "libdex-1"]))
+
+
 def build_project(p: Project) -> None:
+    ensure_local_bin_on_path()
+    if p.name == "xdg-desktop-portal" and not DRY_RUN and not libdex_gdbus_ready():
+        raise StepError("the portal needs libdex built with gdbus support installed system-wide "
+                        "(pkg-config variable gdbus_codegen_extension is empty): install the libdex step first.")
+    if p.name == "credentialsd" and rust_channel():
+        os.environ["RUSTUP_TOOLCHAIN"] = rust_channel()  # overrides rust-toolchain.toml (no extra components)
     run_resolving(["meson", "setup", *p.setup, p.build_dir, "--reconfigure"], p.path)
     run_resolving(["meson", "compile", "-C", p.build_dir], p.path)
 
 
+def system_portal_preferred() -> dict[str, str]:
+    """The [preferred] backends of the portal config the desktop currently uses (to extend, not replace)."""
+    desktops = [d.lower() for d in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":") if d]
+    dirs = [Path("/etc/xdg/xdg-desktop-portal"), Path("/usr/local/share/xdg-desktop-portal")]
+    dirs += [Path(d) / "xdg-desktop-portal" for d in os.environ.get("XDG_DATA_DIRS", "/usr/share").split(":") if d]
+    names = [f"{d}-portals.conf" for d in desktops] + ["portals.conf"]
+    for directory in dirs:
+        for name in names:
+            cp = read_ini(directory / name)
+            if cp.has_section("preferred"):
+                return dict(cp.items("preferred"))
+    return {"default": "*"}
+
+
+def portal_conf_files() -> list[Path]:
+    """Files the portal reads first for this desktop: `<desktop>-portals.conf` beats `portals.conf`, so an
+    existing desktop-specific user file has to carry the entry as well."""
+    desktops = [d.lower() for d in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":") if d]
+    specific = [PORTAL_CONF.with_name(f"{d}-portals.conf") for d in desktops]
+    return [PORTAL_CONF, *[f for f in specific if f.exists()]]
+
+
+def portal_conf_ok() -> bool:
+    return all(read_ini(path).get("preferred", CREDENTIAL_IMPL_IFACE, fallback="") == "credentialsd"
+               for path in portal_conf_files())
+
+
+def write_portal_conf() -> None:
+    """Without this the portal finds no backend for the Credential interface and never exports it:
+    the desktop's own config (e.g. gnome-portals.conf) only lists gnome/gtk. Existing sections of the
+    user's files are kept (their comments are not)."""
+    for path in portal_conf_files():
+        cp = read_ini_for_edit(path)
+        if not cp.has_section("preferred"):
+            cp.add_section("preferred")
+            for key, value in system_portal_preferred().items():
+                cp.set("preferred", key, value)
+        cp.set("preferred", CREDENTIAL_IMPL_IFACE, "credentialsd")
+        say(f"  write {path} (mode 644)")
+        if not DRY_RUN:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_ini(cp, path)
+
+
+def credentialsd_activatable() -> bool:
+    return "xyz.iinuwa.credentialsd" in out(["busctl", "--user", "list", "--activatable", "--no-pager"])
+
+
+def portal_running() -> bool:
+    """Introspecting an activatable name would start it: look at the owned names first, so `check` never does."""
+    return "org.freedesktop.portal.Desktop" in out(["busctl", "--user", "list", "--acquired", "--no-pager"])
+
+
+def portal_credential_ready() -> bool:
+    if not portal_running():
+        return False
+    intro = out(["busctl", "--user", "introspect", "org.freedesktop.portal.Desktop",
+                 "/org/freedesktop/portal/desktop", "--no-pager"], timeout=30)
+    return "org.freedesktop.portal.experimental.Credential" in intro
+
+
+def reload_user_services() -> None:
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "reload", "dbus"], check=False)  # dbus-daemon re-reads service files
+
+
+def restart_portal() -> None:
+    reload_user_services()
+    run(["systemctl", "--user", "restart", "xdg-desktop-portal"], check=False)  # no session: the re-check says so
+    if not DRY_RUN:
+        for _ in range(15):
+            if portal_credential_ready():
+                return
+            time.sleep(1)
+
+
+def libdex_linked() -> bool:
+    return any("libdex-1" in line and "/usr/local" in line for line in out(["ldconfig", "-p"]).splitlines())
+
+
+def rust_channel() -> str | None:
+    text = read_text(SRC_DIR / "credentialsd" / "rust-toolchain.toml") or ""
+    match = re.search(r'^channel\s*=\s*"([^"]+)"', text, re.M)
+    return match.group(1) if match else None
+
+
+def rust_ok() -> bool:
+    channel = rust_channel()
+    if not channel:
+        return False
+    ensure_local_bin_on_path()
+    try:
+        return subprocess.run([str(CARGO_BIN / "rustup"), "run", channel, "cargo", "--version"],
+                              capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def install_rust() -> None:
+    """credentialsd pins a Rust newer than Ubuntu's (its manifest needs TOML 1.1): use rustup in ~/.cargo."""
+    # a dry run on a fresh machine has no credentialsd checkout yet: name where the pin will come from
+    channel = rust_channel() or ("<channel pinned in credentialsd/rust-toolchain.toml>" if DRY_RUN else None)
+    if not channel:
+        raise StepError("credentialsd/rust-toolchain.toml not found: the credentialsd source step comes first")
+    rustup = CARGO_BIN / "rustup"
+    if not rustup.exists():
+        script = CACHE_DIR / "rustup-init.sh"
+        if not DRY_RUN:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        run(["curl", "--proto", "=https", "--tlsv1.2", "-sSf", "https://sh.rustup.rs", "-o", str(script)])
+        run(["sh", str(script), "-y", "--profile", "minimal", "--default-toolchain", "none", "--no-modify-path"])
+    run([str(rustup), "toolchain", "install", channel, "--profile", "minimal"])
+    ensure_local_bin_on_path()
+
+
 def credentialsd_actions() -> list[Action]:
+    blueprint = Action(f"blueprint-compiler >= {'.'.join(map(str, BLUEPRINT_MIN))} (built into ~/.local; Ubuntu ships 0.19)",
+                       blueprint_ok, build_blueprint)
+    rust = Action("Rust toolchain pinned by credentialsd (via rustup in ~/.cargo; Ubuntu's cargo is too old)",
+                  rust_ok, install_rust)
     actions: list[Action] = []
     for p in PROJECTS:
+        actions.append(Action(f"{p.name}: source at {p.ref}" + (" with submodules" if p.recurse else ""),
+                              lambda p=p: source_ready(p), lambda p=p: fetch_source(p)))
+        if p.name == "credentialsd":
+            actions += [rust, blueprint]
         actions += [
-            Action(f"{p.name}: source at {p.ref}" + (" with submodules" if p.recurse else ""),
-                   lambda p=p: source_ready(p), lambda p=p: fetch_source(p)),
             Action(f"{p.name}: built (missing build dependencies are installed automatically)",
                    lambda p=p: is_built(p), lambda p=p: build_project(p)),
             Action(f"{p.name}: installed into /usr/local", lambda p=p: is_installed(p),
-                   lambda p=p: run(["meson", "install", "-C", p.build_dir], cwd=p.path, sudo=True)),
+                   lambda p=p: install_project(p)),
         ]
+        if p.name == "libdex":
+            actions.append(Action("libdex from /usr/local is known to the dynamic linker",
+                                  libdex_linked, lambda: run(["ldconfig"], sudo=True)))
     actions.append(Action("xdg-desktop-portal: credential portal enabled (systemd user drop-in)",
                           lambda: read_text(PORTAL_DROPIN) == PORTAL_DROPIN_TEXT,
                           lambda: (write_file(PORTAL_DROPIN, PORTAL_DROPIN_TEXT),
                                    run(["systemctl", "--user", "daemon-reload"]))))
+    actions += [
+        Action("portal config names credentialsd as the Credential backend (~/.config/xdg-desktop-portal)",
+               portal_conf_ok, write_portal_conf),
+        Action("session bus knows the credentialsd service files", credentialsd_activatable, reload_user_services,
+               needs_relogin=True,
+               hint="Log out and back in once so the session picks up the new activation files, then re-run."),
+        Action("patched portal answers with the Credential interface", portal_credential_ready, restart_portal,
+               needs_relogin=True,
+               hint="Log out and back in once, then re-run; see the log for the portal journal."),
+    ]
     return actions
 
 
@@ -666,9 +1126,16 @@ def nm_link() -> Path:
 
 
 def nm_target() -> Path:
-    lib64 = Path("/usr/local/lib64")
-    libdir = lib64 if lib64.is_dir() and not lib64.is_symlink() else Path("/usr/local/lib")
-    return libdir / "mozilla/native-messaging-hosts" / NM_MANIFEST
+    """Where meson installed the manifest (libdir is multiarch on Debian/Ubuntu: lib/x86_64-linux-gnu)."""
+    for dest in installed_map(next(p for p in PROJECTS if p.name == "credentialsd")).values():
+        if dest.endswith(NM_MANIFEST):
+            return Path(dest)
+    # lib/mozilla/... or the multiarch lib/<triplet>/mozilla/...: two fixed depths, never a walk of /usr/local/lib
+    pattern = f"mozilla/native-messaging-hosts/{NM_MANIFEST}"
+    found = next(iter(sorted([*Path("/usr/local").glob(f"lib*/{pattern}"), *Path("/usr/local").glob(f"lib*/*/{pattern}")])), None)
+    if found:
+        return found
+    return Path("/usr/local/lib/mozilla/native-messaging-hosts") / NM_MANIFEST
 
 
 def nm_ok() -> bool:
@@ -683,14 +1150,67 @@ def link_nm() -> None:
 
 
 def extension_in_profile() -> bool:
-    for ext_json in MOZ_PROFILE.glob("*/extensions.json"):
-        try:
-            for addon in json.loads(ext_json.read_text()).get("addons", []):
-                if addon.get("id") == XPI_ID and addon.get("active"):
-                    return True
-        except (OSError, json.JSONDecodeError):
-            continue
-    return False
+    profile = active_profile()
+    if not profile:
+        return False
+    try:
+        addons = json.loads((profile / "extensions.json").read_text()).get("addons", [])
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(addon.get("id") == XPI_ID and addon.get("active") for addon in addons)
+
+
+FIREFOX_BIN = "/usr/lib/firefox/firefox"
+
+
+def extension_granted() -> bool:
+    """The policy install grants <all_urls> automatically; confirm it in the profile."""
+    profile = active_profile()
+    if not profile:
+        return False
+    try:
+        entry = json.loads((profile / "extension-preferences.json").read_text()).get(XPI_ID, {})
+    except (OSError, json.JSONDecodeError):
+        return False
+    return "<all_urls>" in entry.get("origins", [])
+
+
+def extension_ready() -> bool:
+    return extension_in_profile() and extension_granted()
+
+
+def restart_firefox() -> None:
+    if ASSUME_YES:
+        # an unattended run (ubuntu-tweak init) neither closes the user's browser nor opens one over ssh:
+        # the policy is in place, so the extension is installed at Firefox's next start (also in --dry-run)
+        say("  Firefox is not restarted by --yes: the extension is installed by policy at its next start")
+        return
+    if firefox_running():
+        say("  closing Firefox (session restore brings your tabs back)")
+        run(["pkill", "-TERM", "-x", "firefox"], check=False)
+        if DRY_RUN:  # nothing was closed: do not wait for it, show the launch and stop
+            run([FIREFOX_BIN])
+            return
+        for _ in range(40):
+            if not firefox_running():
+                break
+            time.sleep(1)
+        else:
+            raise StepError("Firefox did not close within 40 s: close it manually and re-run.")
+    fflog = STATE_DIR / "firefox.log"
+    say(f"  starting Firefox (its output goes to {fflog})")
+    if DRY_RUN:
+        run([FIREFOX_BIN])
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(fflog, "a") as handle:
+        subprocess.Popen([FIREFOX_BIN], start_new_session=True, stdout=handle, stderr=handle,
+                         stdin=subprocess.DEVNULL)
+    for _ in range(60):
+        time.sleep(2)
+        if extension_ready():
+            return
+    # the row is context only: run_actions prints a note if the extension is not active yet
 
 
 def policy_data() -> dict:
@@ -702,7 +1222,9 @@ def policy_data() -> dict:
 
 def policy_ok() -> bool:
     entry = policy_data().get("policies", {}).get("ExtensionSettings", {}).get(XPI_ID, {})
-    return entry.get("installation_mode") == "normal_installed" and entry.get("install_url") == XPI_URL
+    # force_installed is accepted too: ubuntu-tweaks' firefox-policy may manage this entry (credentialsd_helper)
+    return entry.get("installation_mode") in ("normal_installed", "force_installed") and \
+        entry.get("install_url") == XPI_URL
 
 
 def install_policy() -> None:
@@ -714,11 +1236,59 @@ def install_policy() -> None:
     sudo_write(FIREFOX_POLICIES, json.dumps(data, indent=2) + "\n")
 
 
+REGISTER_PROBE = (
+    "import asyncio, sys\nfrom dbus_next.aio import MessageBus\nfrom dbus_next import Message\n"
+    "async def main():\n"
+    "    bus = await MessageBus().connect()\n"
+    "    r = await bus.call(Message('org.freedesktop.portal.Desktop','/org/freedesktop/portal/desktop',"
+    "'org.freedesktop.host.portal.Registry','Register',signature='sa{sv}',body=[sys.argv[1],{}]))\n"
+    "    print('OK' if r.message_type.name == 'METHOD_RETURN' else 'ERR ' + str(r.body))\n"
+    "asyncio.run(main())\n"
+)
+
+
+def portal_registry_ok() -> bool:
+    """The helper must register its app id with the portal, otherwise credentialsd rejects every
+    request ('App ID could not be verified'). The portal only accepts ids with a .desktop file."""
+    if not portal_running():
+        return False
+    return out(["python3", "-c", REGISTER_PROBE, FIREFOX_APP_ID], timeout=30).endswith("OK")
+
+
+FLATPAK_APPLICATION_DIRS = [Path("/var/lib/flatpak/exports/share/applications"),
+                            HOME / ".local/share/flatpak/exports/share/applications"]
+
+
+def app_desktop_exists() -> bool:
+    """Is there already a desktop file with the app id (Flatpak Firefox, another package)? A copy in
+    ~/.local/share/applications would shadow it: it would lose its menu entry and its Exec."""
+    name = f"{FIREFOX_APP_ID}.desktop"
+    dirs = [Path(d) / "applications" for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") if d]
+    dirs += FLATPAK_APPLICATION_DIRS
+    return any((d / name).exists() for d in dirs)
+
+
+def write_app_desktop() -> None:
+    if app_desktop_exists():
+        say(f"  {FIREFOX_APP_ID}.desktop already exists on this system: not shadowing it")
+        return
+    write_file(APP_DESKTOP, (
+        "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Firefox (portal app id)\n"
+        "Comment=App id registered by the credentialsd native-messaging helper (passkey-qr); not shown in menus\n"
+        "Exec=firefox %u\nIcon=firefox\nNoDisplay=true\nTerminal=false\n"))
+
+
 def extension_actions() -> list[Action]:
     return [
         Action("native-messaging host linked for Firefox (replaces a manual manifest)", nm_ok, link_nm,
-               hint=f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
+               hint=lambda: f"{nm_target()} is missing: the credentialsd install step has to succeed first."),
         Action("Firefox policy installs the signed extension on next start", policy_ok, install_policy),
+        Action("portal accepts the helper's app id (needs org.mozilla.firefox.desktop)", portal_registry_ok,
+               write_app_desktop, needs_relogin=True, hint="The portal rejects the helper's registration: see the log."),
+        Action("Firefox restarted: extension active with access to all sites", extension_ready, restart_firefox,
+               required=False,
+               hint="Firefox did not report the extension as installed within 2 minutes: see "
+                    f"{STATE_DIR}/firefox.log and about:policies / about:addons."),
     ]
 
 
@@ -790,29 +1360,108 @@ def status_rows() -> list[tuple[str, bool, bool]]:
         if title.startswith("3."):
             rows += [(a.name, a.check(), False) for a in actions]
         else:
-            rows += [(a.name, a.check(), not a.optional) for a in actions]
+            rows += [(a.name, a.check(), a.required and not a.optional) for a in actions]
     return rows
+
+
+def unmet_rows(rows: list[tuple[str, bool, bool]]) -> list[str]:
+    return [label for label, ok, required in rows if required and not ok]
 
 
 def cmd_check(_: argparse.Namespace) -> None:
     """Read-only: exit 0 when every required row holds, 3 (and the unmet rows) otherwise."""
-    unmet = [label for label, ok, required in status_rows() if required and not ok]
+    unmet = unmet_rows(status_rows())
     for label in unmet:
         say(f"  missing: {label}")
     sys.exit(3 if unmet else 0)
 
 
+SNAPSHOT_TIMEOUT = 8  # seconds per diagnostic command: the snapshot must never delay the real error message
+
+
+def log_snapshot() -> None:
+    """Write the facts needed to debug a run into the log file (no secrets); never raises."""
+    if not LOG_FILE:
+        return
+    try:
+        _write_snapshot()
+    except Exception as err:  # a failing diagnostic must not mask the StepError that called it
+        log(f"(snapshot failed: {err})")
+
+
+def _write_snapshot() -> None:
+    cmds = [
+        ["uname", "-a"], [FIREFOX_BIN, "--version"], ["bluetoothctl", "list"],
+        ["systemctl", "--user", "is-active", "ha-ble-vhci", "xdg-desktop-portal", "dbus"],
+        ["busctl", "--user", "list", "--activatable", "--no-pager"],
+        ["busctl", "--user", "introspect", "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "--no-pager"],
+        ["cat", str(FIREFOX_POLICIES)], ["ls", "-l", str(HOME / ".mozilla/native-messaging-hosts")],
+        ["journalctl", "--user", "-u", "ha-ble-vhci", "-n", "25", "--no-pager"],
+        ["journalctl", "--user", "-u", "xdg-desktop-portal", "-n", "25", "--no-pager"],
+        ["journalctl", "--user", "-n", "40", "--no-pager", "-t", "credentialsd"],
+        ["journalctl", "--user", "-n", "25", "--no-pager", "-u", "xyz.iinuwa.credentialsd*"],
+    ]
+    log("\n===== snapshot =====")
+    for cmd in cmds:
+        log(f"$ {' '.join(cmd)}")
+        log(out(cmd, timeout=SNAPSHOT_TIMEOUT) or "(empty)")
+    log(f"active profile: {active_profile()} (installs.ini default: {install_default_name()})")
+    for prefs in MOZ_PROFILE.glob("*/extension-preferences.json"):
+        try:
+            log(f"{prefs}: {json.loads(prefs.read_text()).get(XPI_ID)}")
+        except (OSError, json.JSONDecodeError):
+            pass
+    log(f"extension_in_profile={extension_in_profile()} granted={extension_granted()}")
+    log("===== end snapshot =====")
+
+
+def open_test_page() -> None:
+    if ASSUME_YES:  # unattended runs (ubuntu-tweak init) must not pop a browser tab open
+        return
+    url = "https://webauthn.io"
+    if not confirm(f"Open {url} in Firefox now to test the phone/QR option?"):
+        return
+    if DRY_RUN:
+        run([FIREFOX_BIN, "--new-tab", url])
+        return
+    subprocess.Popen([FIREFOX_BIN, "--new-tab", url], start_new_session=True, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
+
 def cmd_install(_: argparse.Namespace) -> None:
+    """Exit codes: 0 everything required is in place; 3 finished what it could and something waits for
+    you (listed); 1 a step failed (StepError / failed command, see main)."""
     say("passkey-qr changes your system step by step; "
         + ("--yes answers every step for you" if ASSUME_YES else "every step asks first")
         + ", and anything already\napplied (checked against the real system state) is skipped.")
     for step in STEPS:
         step()
+    if DRY_RUN:
+        if NOTES:
+            say("\nWould need you: " + "; ".join(NOTES))
+        return
+    rows = status_rows()  # every check runs once; the printout, exit code and hints all come from it
     say("\nFinal state:")
-    cmd_status(argparse.Namespace())
-    say(f"  extension active in your Firefox profile: {'yes' if extension_in_profile() else 'not yet (restart Firefox)'}")
-    say("\nNext: restart Firefox, open about:addons -> credentialsd-helper -> Permissions and allow all sites,\n"
-        "then test at https://webauthn.io (register/sign in, choose the phone/QR option).")
+    for label, ok, _ in rows:
+        say(f"  [{'x' if ok else ' '}] {label}")
+    log_snapshot()
+    unmet = unmet_rows(rows)
+    if NOTES or unmet:
+        say("\nNot finished:")
+        for note in NOTES:
+            say(f"  waiting for you: {note}")
+        for label in unmet:
+            say(f"  missing: {label}")
+        say("Do that, then re-run `passkey-qr install`: finished actions are skipped.")
+        sys.exit(3)
+    if all(ok for label, ok, _ in rows if label.startswith("Firefox restarted")):
+        say("\nEverything is installed and verified. On webauthn.io choose register/sign in, then the "
+            "phone/QR option and scan the code (the phone must be within BLE range of the ESP32 proxy).")
+    else:
+        say("\nEverything is installed. Restart Firefox once: it then installs the extension and offers "
+            "the phone/QR option (test on https://webauthn.io; the phone must be within BLE range "
+            "of the ESP32 proxy).")
+    open_test_page()
 
 
 def main() -> None:
@@ -831,15 +1480,38 @@ def main() -> None:
     sub.add_parser("install", help="apply everything that is missing").set_defaults(func=cmd_install)
     args = parser.parse_args()
     DRY_RUN, ASSUME_YES, REMOVE_SNAP = args.dry_run, args.yes, args.remove_snap
+    log_path = init_log(args.cmd) if args.cmd == "install" and not DRY_RUN else None
+    if log_path:
+        say(f"log file: {log_path}")
+    where = f"Full log: {log_path}" if log_path else "(no log file: not an install run)"
+
+    def waiting() -> str:
+        """What already waits for a person, so a later failure does not hide it."""
+        return "".join(f"\nstill waiting for you: {note}" for note in NOTES)
+
     try:
         args.func(args)
     except StepError as err:
-        sys.exit(f"\nstopped: {err}\nFix the cause and re-run `passkey-qr install`: finished actions are skipped.")
+        log(f"STOPPED: {err}")
+        print(f"\nstopped: {err}\nFix the cause and re-run `passkey-qr install`: finished actions are skipped.\n"
+              f"{where}{waiting()}", file=sys.stderr, flush=True)
+        log_snapshot()  # after the message: a broken session must not delay it
+        sys.exit(1)
     except subprocess.CalledProcessError as err:
-        sys.exit(f"\ncommand failed (exit {err.returncode}): {' '.join(map(str, err.cmd))}\n"
-                 "Re-run `passkey-qr install` after fixing it: finished actions are skipped.")
+        log(f"COMMAND FAILED (exit {err.returncode}): {err.cmd}")
+        print(f"\ncommand failed (exit {err.returncode}): {' '.join(map(str, err.cmd))}\n"
+              f"Re-run `passkey-qr install` after fixing it: finished actions are skipped.\n{where}{waiting()}",
+              file=sys.stderr, flush=True)
+        log_snapshot()
+        sys.exit(1)
     except (KeyboardInterrupt, EOFError):
+        log("aborted by user")
         sys.exit("\naborted")
+    except Exception:
+        log(traceback.format_exc())
+        raise
+    if log_path:
+        say(f"\nlog file: {log_path}")
 
 
 if __name__ == "__main__":
