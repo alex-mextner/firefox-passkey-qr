@@ -65,6 +65,8 @@ BLUEPRINT_TAG = "v0.20.4"
 BLUEPRINT_MIN = (0, 20, 4)  # credentialsd-ui requires >= 0.20.4, Ubuntu 26.04 ships 0.19
 LOCAL_BIN = HOME / ".local/bin"
 CARGO_BIN = HOME / ".cargo/bin"
+PORTAL_CONF = HOME / ".config/xdg-desktop-portal/portals.conf"
+CREDENTIAL_IMPL_IFACE = "org.freedesktop.impl.portal.experimental.Credential"
 PORTAL_DROPIN = HOME / ".config/systemd/user/xdg-desktop-portal.service.d/credential.conf"
 PORTAL_DROPIN_TEXT = "[Service]\nEnvironment=XDG_DESKTOP_PORTAL_ENABLE_EXPERIMENTAL=credential\n"
 
@@ -833,6 +835,34 @@ def build_project(p: Project) -> None:
     run_resolving(["meson", "compile", "-C", p.build_dir], p.path)
 
 
+def system_portal_preferred() -> dict[str, str]:
+    """The [preferred] backends of the portal config the desktop currently uses (to extend, not replace)."""
+    desktops = [d.lower() for d in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":") if d]
+    dirs = [Path("/etc/xdg/xdg-desktop-portal"), Path("/usr/local/share/xdg-desktop-portal")]
+    dirs += [Path(d) / "xdg-desktop-portal" for d in os.environ.get("XDG_DATA_DIRS", "/usr/share").split(":") if d]
+    names = [f"{d}-portals.conf" for d in desktops] + ["portals.conf"]
+    for directory in dirs:
+        for name in names:
+            cp = read_ini(directory / name)
+            if cp.has_section("preferred"):
+                return dict(cp.items("preferred"))
+    return {"default": "*"}
+
+
+def portal_conf_ok() -> bool:
+    cp = read_ini(PORTAL_CONF)
+    return cp.get("preferred", CREDENTIAL_IMPL_IFACE, fallback="") == "credentialsd"
+
+
+def write_portal_conf() -> None:
+    """Without this the portal finds no backend for the Credential interface and never exports it:
+    the desktop's own config (e.g. gnome-portals.conf) only lists gnome/gtk."""
+    preferred = system_portal_preferred() if not PORTAL_CONF.exists() else dict(read_ini(PORTAL_CONF).items("preferred"))
+    preferred[CREDENTIAL_IMPL_IFACE] = "credentialsd"
+    body = "[preferred]\n" + "".join(f"{key}={value}\n" for key, value in preferred.items())
+    write_file(PORTAL_CONF, body)
+
+
 def credentialsd_activatable() -> bool:
     return "xyz.iinuwa.credentialsd" in out(["busctl", "--user", "list", "--activatable", "--no-pager"])
 
@@ -916,6 +946,8 @@ def credentialsd_actions() -> list[Action]:
                           lambda: (write_file(PORTAL_DROPIN, PORTAL_DROPIN_TEXT),
                                    run(["systemctl", "--user", "daemon-reload"]))))
     actions += [
+        Action("portal config names credentialsd as the Credential backend (~/.config/xdg-desktop-portal)",
+               portal_conf_ok, write_portal_conf),
         Action("session bus knows the credentialsd service files", credentialsd_activatable, reload_user_services,
                hint="Log out and back in once so the session picks up the new activation files, then re-run."),
         Action("patched portal answers with the Credential interface", portal_credential_ready, restart_portal,
@@ -1159,10 +1191,12 @@ def main() -> None:
     try:
         args.func(args)
     except StepError as err:
+        log(f"STOPPED: {err}")
         log_snapshot()
         sys.exit(f"\nstopped: {err}\nFix the cause and re-run `passkey-qr install`: finished actions are skipped.\n"
                  f"Full log: {log_path}")
     except subprocess.CalledProcessError as err:
+        log(f"COMMAND FAILED (exit {err.returncode}): {err.cmd}")
         log_snapshot()
         sys.exit(f"\ncommand failed (exit {err.returncode}): {' '.join(map(str, err.cmd))}\n"
                  f"Re-run `passkey-qr install` after fixing it: finished actions are skipped.\nFull log: {log_path}")
