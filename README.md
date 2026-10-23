@@ -18,7 +18,7 @@ automatically, after a confirmation:
 | 3 | **Only if the PC has no Bluetooth and Home Assistant is reachable:** installs [ha-ble-vhci](https://github.com/alex-mextner/ha-ble-vhci) | the QR flow requires the PC to *hear the phone's BLE advertisement*; ha-ble-vhci gets those from your ESPHome Bluetooth proxy through Home Assistant and presents them to BlueZ as a local adapter |
 | 4 | builds [credentialsd](https://github.com/linux-credentials/credentialsd) + its patched `xdg-desktop-portal` into `/usr/local` | the credential manager that implements hybrid on Linux |
 | 5 | native-messaging link + a Firefox policy (`/etc/firefox/policies/policies.json`, `normal_installed`) that installs the Mozilla-signed `credentialsd-helper` extension on next start (you can still disable it) | intercepts `navigator.credentials` in Firefox and shows the phone/USB chooser |
-| 6 | **self-healing**, user space only: systemd drop-ins, a health-check timer and a Firefox-prefs path unit (below) | every link of the chain restarts and repairs itself; an offline Bluetooth proxy is announced on the desktop instead of a silently hanging QR window |
+| 6 | **self-healing**, user space only: systemd drop-ins, a request watcher (no timer, no polling) and a Firefox-prefs path unit (below) | every link of the chain restarts and repairs itself; while you use a passkey an unreachable Home Assistant or an offline Bluetooth proxy is announced once on the desktop instead of a silently hanging QR window, and nothing is checked or shown while you do not |
 
 If the PC has a real Bluetooth adapter, step 3 does nothing. If it has neither
 Bluetooth nor Home Assistant, the installer tells you to get a USB BLE dongle.
@@ -102,27 +102,51 @@ Home Assistant tokens are never logged.
   A `RestartPreventExitStatus=` from another drop-in still wins: `passwords-appd` keeps `=1` on purpose, because
   its exit 1 now only means "the bus name is already owned" (another instance is alive) and restarting would
   only fight it; unreadable data or a locked keyring exit 75 and are retried.
-* **Health check** - `passkey-qr-health.timer` runs `passkey-qr health` every 45 s from a copy of the installer in
-  `~/.local/libexec/passkey-qr/` (`install` refreshes it after you update the checkout; a stale copy does not fail `check`). It
-  starts `ha-ble-vhci` if it is stopped and restarts it when it registered no adapter or says "no scanner" while
-  Home Assistant sees one; powers on an unpowered adapter; restarts `xdg-desktop-portal` if it does not offer
-  `org.freedesktop.portal.experimental.Credential`; starts `credentialsd`/`credentialsd-ui` on demand (restart
-  when that fails); and **ends a stuck request**: a `credentialsd-firefox-helper` process (one per WebAuthn
-  request, it ignores SIGTERM when its request hangs) older than 10 minutes gets SIGKILL by pid and credentialsd
-  + its UI are restarted (deferred while another, younger request is still running, so it is never aborted),
-  because an abandoned request leaves credentialsd scanning forever. Restarts of the portal and of
-  credentialsd that did not help are retried at most every 5 minutes.
-* **Offline proxy signal** - when `ha-ble-vhci --scanners` exits 4 (no Bluetooth proxy online) or 1 (Home
-  Assistant unreachable) in two consecutive runs you get **one** critical desktop notification
-  (`notify-send`), repeated at most hourly while the outage lasts, and a "back online" notification when it
-  ends; an outage within 10 minutes of a recovery is a flap and stays in the journal. Everything is logged:
-  `journalctl --user -u passkey-qr-health`. State: `~/.local/state/passkey-qr/health.json`.
+* **Request watcher** - `passkey-qr-watch.service` runs `passkey-qr watch` from a copy of the installer in
+  `~/.local/libexec/passkey-qr/` (`install` refreshes it after you update the checkout; a stale copy does not fail
+  `check`). It is **blocked on the session bus** (`busctl --user monitor`, woken only by the Firefox helper's
+  `Registry.Register` and `CreateCredential`/`GetCredential` calls to the portal): no timer, no polling,
+  **nothing is checked, no Home Assistant query is made and no notification is shown while you are not using a
+  passkey**. A portal call only counts when a `credentialsd-firefox-helper` process is alive 5 s after it (so
+  other programs cannot trigger it, and a portal that hangs before the credential call is still noticed through
+  the helper's earlier registration). Another Firefox instance registering its app id with the portal (a headless
+  test browser, say) also reaches the watcher, which sees at once that the call is not the helper's, drops it
+  and goes back to sleep: no process scan, no query, no journal line. The moment a passkey request starts it
+  checks the chain at once and every 20 s for as long as that
+  helper process lives: starts `ha-ble-vhci` if it is stopped and restarts it when it registered no adapter or
+  says "no scanner" while Home Assistant sees one; powers on an unpowered adapter; restarts
+  `xdg-desktop-portal` if it does not offer `org.freedesktop.portal.experimental.Credential`; starts
+  `credentialsd`/`credentialsd-ui` on demand (restart when that fails); and **ends a stuck request**: a helper
+  process older than 10 minutes gets SIGKILL by pid and credentialsd + its UI are restarted (deferred while
+  another, younger request is still running, so it is never aborted). Restarts of the portal and of credentialsd
+  that did not help are retried at most every 5 minutes. While a request is pending the file
+  `$XDG_RUNTIME_DIR/passkey-qr/request-pending` exists; `passkey-qr status` shows it. The old 45 s
+  `passkey-qr-health.timer` is removed by `install`. `passkey-qr health` does one such pass by hand, and only
+  when a request is pending.
+* **Home Assistant / proxy signal** - only while a request is pending: when `ha-ble-vhci --scanners` exits 4 (no
+  Bluetooth proxy online: after a Home Assistant restart the ESP32 is back within a minute or two) or 5 (Home
+  Assistant unreachable, asked twice 3 s apart) you get **one** desktop notification (`notify-send`) that says
+  what is wrong in words (`nothing answers on its port (it is restarting or stopped)`, `its host name does not
+  resolve`, ...) and what was found on the server (below). The same failure is told at most every 3 minutes even
+  if you retry the request, and "back online" is shown only to a request that was told about the failure. Idle,
+  everything goes to the journal only: `journalctl --user -u passkey-qr-watch`. State:
+  `~/.local/state/passkey-qr/health.json`.
+* **Home Assistant container repair (opt-in)** - when Home Assistant is unreachable during a request and
+  `~/.config/passkey-qr/ha-repair` names its Docker container (`HA_CONTAINER=homeassistant-homeassistant-1`,
+  optionally `HA_SSH_HOST=<ssh host>`, default: the host of the Home Assistant URL), the watcher looks at it over
+  your existing passwordless SSH (`ssh -o BatchMode=yes`: it never asks and never trusts an unknown host key; at
+  most once a minute). A container that is **stopped** is `docker start`ed (`unpause`d when paused); one that has
+  been **unhealthy and unreachable for 4 minutes** is `docker restart`ed (at most every 30 minutes); a container
+  that is running and healthy, or booting (< 10 min), or that Docker has just stopped is never touched, so a
+  deliberate Home Assistant restart is never fought. No SSH access, no repair.
 * **Firefox prefs** - `passkey-qr-prefs.path` watches `~/.mozilla/firefox/profiles.ini` and `installs.ini`
   (and `passkey-qr-prefs.service` also runs at login); `passkey-qr heal-prefs` re-applies only the managed
-  `user.js` block when a Firefox update or a new profile dropped it, logs the drift and sends a notification.
+  `user.js` block when a Firefox update or a new profile dropped it and logs the drift to the journal (no
+  notification: you are not using a passkey at that moment).
 
-Test seams: `PASSKEY_QR_STUCK_SECONDS` (age limit), `PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT` (pretend the
-`--scanners` exit code, e.g. `4`, to see the notification path).
+Test seams: `PASSKEY_QR_STUCK_SECONDS` (age limit), `PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT` and
+`PASSKEY_QR_HEALTH_FAKE_SCANNERS_REASON` (pretend the `--scanners` exit code, e.g. `5`, and its last stderr line, to
+see the notification path).
 
 ## Not supported
 

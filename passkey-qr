@@ -8,8 +8,9 @@ Installs and wires together, step by step and only after you confirm each step:
   * credentialsd + patched xdg-desktop-portal (built from source; missing build
     dependencies are found and installed automatically)
   * the signed credentialsd Firefox extension and its native-messaging host
-  * self-healing: systemd restart policy for every service of the chain, a health-check timer that repairs
-    hung pieces and flags an offline Bluetooth proxy on the desktop, and re-applies the Firefox prefs
+  * self-healing: systemd restart policy for every service of the chain, a watcher that wakes only when a passkey
+    request starts (no timer, no polling), repairs hung pieces and tells you once on the desktop if Home
+    Assistant or the Bluetooth proxy is down, and re-applies the Firefox prefs
 
 Every action has a check that looks at the real system state, so re-running
 skips whatever is already applied and `passkey-qr status` shows what is left.
@@ -21,7 +22,10 @@ Secure Enclave.
 from __future__ import annotations
 
 import argparse
+import calendar
 import configparser
+import contextlib
+import fcntl
 import getpass
 import json
 import os
@@ -35,10 +39,11 @@ import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, NoReturn, Sequence
+from typing import Callable, Iterator, NoReturn, Sequence
 
 HOME = Path.home()
 SRC_DIR = Path(os.environ.get("PASSKEY_QR_SRC", HOME / "dev")).expanduser()
@@ -46,7 +51,7 @@ CACHE_DIR = HOME / ".cache/passkey-qr"
 BRIDGE_REPO = os.environ.get("PASSKEY_QR_BRIDGE_REPO", "https://github.com/alex-mextner/ha-ble-vhci")
 BRIDGE_DIR = HOME / ".local/share/ha-ble-vhci"
 BRIDGE_CFG = HOME / ".config/ha-ble-vhci"
-BRIDGE_VERSION = "0.1.6"
+BRIDGE_VERSION = "0.1.7"  # 0.1.7: --scanners exits 5 when Home Assistant is unreachable (0.1.6 said 1)
 BRIDGE_UNIT = HOME / ".config/systemd/user/ha-ble-vhci.service"
 CREDSD_REPO = "https://github.com/linux-credentials/credentialsd"
 CREDSD_TAG = "v0.3.1"
@@ -574,7 +579,10 @@ def scanners_result() -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run([str(BRIDGE_BIN), "--scanners", "--url", url, "--token-file", str(token)],
                               capture_output=True, text=True, timeout=15)  # the bridge itself waits <= ~12 s
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:  # it connected to something that never answers: that is "unreachable"
+        return subprocess.CompletedProcess([str(BRIDGE_BIN)], EXIT_UNREACHABLE, "",
+                                           "timed out: Home Assistant did not answer within 15 s")
+    except OSError:
         return None
 
 
@@ -1419,9 +1427,11 @@ def extension_actions() -> list[Action]:
 
 # --------------------------------------------------------------------------- self-healing
 # Every link of the passkey/QR chain (bridge, portal, credentialsd, its UI, the Firefox helper, the Firefox
-# prefs) restarts and repairs itself: systemd drop-ins restart a dead service at once, `health` (run by a
-# timer) repairs what systemd cannot see (hung, missing D-Bus interface, stuck request) and tells the user
-# when the ESP32 proxy is offline, `heal-prefs` (run by a path unit) puts the Firefox prefs back.
+# prefs) restarts and repairs itself: systemd drop-ins restart a dead service at once; `watch` (a unit blocked
+# on the session bus: no timer, no polling) wakes when a passkey request starts and only then checks the chain,
+# repairs what systemd cannot see (hung, missing D-Bus interface, stuck request, stopped Home Assistant
+# container) and tells the user, once, if Home Assistant or the ESP32 proxy is down; `heal-prefs` (run by a path
+# unit) puts the Firefox prefs back. While nobody uses a passkey nothing is queried and nobody is notified.
 LIBEXEC_DIR = HOME / ".local/libexec/passkey-qr"
 HEALTH_BIN = LIBEXEC_DIR / "passkey-qr"  # a copy of this file: the units survive a moved or switched checkout
 SYSTEMD_USER = HOME / ".config/systemd/user"
@@ -1436,9 +1446,31 @@ RESTART_SEC = {  # unit -> RestartSec; a unit that is not installed on this mach
     "xyz.iinuwa.credentialsd.UiControl": 2,
     "passwords-appd": 5,
 }
-HEALTH_CONFIRM_RUNS = 2  # consecutive failing runs before the user is told (a proxy blip is not an outage)
-HEALTH_REMIND_SECONDS = 3600  # a still-running outage is mentioned again after this long
-HEALTH_COOLDOWN_SECONDS = 600  # an outage right after a recovery is a flap: no new notification
+PORTAL_NAME = "org.freedesktop.portal.Desktop"
+REQUEST_INTERFACE = "org.freedesktop.portal.experimental.Credential"
+REGISTRY_INTERFACE = "org.freedesktop.host.portal.Registry"  # the helper registers its app id with this first
+REQUEST_MEMBERS = ("CreateCredential", "GetCredential")  # a Firefox helper asking the portal for a passkey
+REQUEST_MATCHES = (f"type='method_call',interface='{REQUEST_INTERFACE}'",
+                   # only Firefox's id: other applications register with the portal all the time
+                   f"type='method_call',interface='{REGISTRY_INTERFACE}',member='Register',arg0='{FIREFOX_APP_ID}'")
+REQUEST_SETTLE_SECONDS = 5  # a portal call only counts when a Firefox helper is still alive this long after it
+REQUEST_MARKER = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "passkey-qr/request-pending"
+PASS_LOCK = REQUEST_MARKER.with_name("pass.lock")  # held by whoever runs a health pass
+REQUEST_CHECK_SECONDS = 20  # while a request is pending the chain is re-checked this often
+PROBE_RETRY_SECONDS = 3  # a failed Home Assistant query is repeated once before the user is told
+HA_ACTION_TIMEOUT_SECONDS = 30  # docker start/unpause/restart over ssh: a pass waits this long at most for it
+NOTIFY_MIN_SECONDS = 180  # the same failure is told at most this often, however many requests retry
+EXIT_NO_SCANNER = 4  # exit codes of `ha-ble-vhci --scanners`: 0 online, 4 no proxy, 5 Home Assistant unreachable
+EXIT_UNREACHABLE = 5
+OBSOLETE_UNITS = ("passkey-qr-health.timer", "passkey-qr-health.service")  # the 45 s poll the watcher replaced
+HA_REPAIR_CONFIG = HOME / ".config/passkey-qr/ha-repair"  # HA_CONTAINER=<name> [HA_SSH_HOST=<ssh host>]
+HA_BOOT_GRACE_SECONDS = 600  # a container started this recently is booting: Home Assistant needs minutes on a small board
+HA_RESTART_POLICY_GRACE_SECONDS = 30  # a container that stopped this recently is about to be restarted by Docker
+HA_HUNG_SECONDS = 240  # unreachable this long (continuously seen) with an unhealthy container: restart it
+HA_DOWN_GAP_SECONDS = 90  # two sightings further apart than this are two outages
+HA_INSPECT_COOLDOWN = 60  # the container is looked at over SSH at most this often
+HA_REPAIR_COOLDOWN = 1800  # and repaired at most this often
+ACTION_DONE = {"start": "started", "unpause": "unpaused", "restart": "restarted"}  # docker verb -> what the user is told
 BRIDGE_SETTLE_SECONDS = 60  # a freshly started bridge gets this long to register its adapter
 BRIDGE_RESTART_COOLDOWN = 300
 RESTART_COOLDOWN = 300  # a repair that did not help (portal, credentialsd) is retried at most this often
@@ -1511,10 +1543,12 @@ def install_health_copy() -> None:
     if DRY_RUN:
         return
     HEALTH_BIN.parent.mkdir(parents=True, exist_ok=True)
-    tmp = HEALTH_BIN.with_suffix(".tmp")  # the timer may be running the old copy right now: replace, never truncate
+    tmp = HEALTH_BIN.with_suffix(".tmp")  # the watcher may be running the old copy right now: replace, never truncate
     tmp.write_text(mine)
     tmp.chmod(0o755)
     tmp.replace(HEALTH_BIN)
+    if (SYSTEMD_USER / "passkey-qr-watch.service").exists():  # a watcher that runs the old copy picks up the new one
+        run(["systemctl", "--user", "try-restart", "passkey-qr-watch.service"], check=False)
 
 
 def unit_path(path: Path) -> str:
@@ -1522,15 +1556,13 @@ def unit_path(path: Path) -> str:
     return str(path).replace("%", "%%")
 
 
-def health_unit_files() -> dict[Path, str]:
+def watch_unit_files() -> dict[Path, str]:
     return {
-        SYSTEMD_USER / "passkey-qr-health.service": (
-            "[Unit]\nDescription=passkey-qr self-healing health check (bridge, portal, credentialsd, stuck requests)\n\n"
-            f"[Service]\nType=oneshot\nExecStart=\"{unit_path(HEALTH_BIN)}\" health\nSyslogIdentifier=passkey-qr-health\n"
-            "TimeoutStartSec=300\nNice=10\n"),
-        SYSTEMD_USER / "passkey-qr-health.timer": (
-            "[Unit]\nDescription=Run the passkey-qr health check every 45 seconds\n\n"
-            "[Timer]\nOnBootSec=30s\nOnUnitActiveSec=45s\nAccuracySec=5s\n\n[Install]\nWantedBy=timers.target\n"),
+        SYSTEMD_USER / "passkey-qr-watch.service": (
+            "[Unit]\nDescription=passkey-qr: check and repair the passkey chain while a passkey request is pending "
+            "(blocked on the session bus, no polling)\nStartLimitIntervalSec=0\n\n"
+            f"[Service]\nExecStart=\"{unit_path(HEALTH_BIN)}\" watch\nSyslogIdentifier=passkey-qr-watch\n"
+            "Restart=always\nRestartSec=5\nNice=10\n\n[Install]\nWantedBy=default.target\n"),
     }
 
 
@@ -1555,16 +1587,30 @@ def user_unit_enabled(unit: str) -> bool:
     return out(["systemctl", "--user", "is-enabled", unit]) == "enabled"
 
 
-def health_timer_ok() -> bool:
-    return (unit_files_current(health_unit_files()) and os.access(HEALTH_BIN, os.X_OK)
-            and user_unit_enabled("passkey-qr-health.timer") and service_active("passkey-qr-health.timer", user=True))
+def watch_ok() -> bool:
+    return (unit_files_current(watch_unit_files()) and os.access(HEALTH_BIN, os.X_OK)
+            and user_unit_enabled("passkey-qr-watch.service") and service_active("passkey-qr-watch.service", user=True))
 
 
-def enable_health_timer() -> None:
-    for path, text in health_unit_files().items():
+def enable_watch() -> None:
+    for path, text in watch_unit_files().items():
         write_file(path, text)
     run(["systemctl", "--user", "daemon-reload"])
-    run(["systemctl", "--user", "enable", "--now", "passkey-qr-health.timer"])
+    run(["systemctl", "--user", "enable", "passkey-qr-watch.service"])
+    run(["systemctl", "--user", "restart", "passkey-qr-watch.service"])  # a running one keeps the old code
+
+
+def obsolete_units_gone() -> bool:
+    return not any((SYSTEMD_USER / name).exists() for name in OBSOLETE_UNITS)
+
+
+def remove_obsolete_units() -> None:
+    run(["systemctl", "--user", "disable", "--now", "passkey-qr-health.timer"], check=False)
+    for name in OBSOLETE_UNITS:
+        say(f"  remove {SYSTEMD_USER / name}")
+        if not DRY_RUN:
+            (SYSTEMD_USER / name).unlink(missing_ok=True)
+    run(["systemctl", "--user", "daemon-reload"])
 
 
 def prefs_path_ok() -> bool:
@@ -1586,8 +1632,10 @@ def selfheal_actions() -> list[Action]:
                write_restart_policy),
         Action(f"health check copy is current ({HEALTH_BIN})", health_copy_ok, install_health_copy,
                required=False),  # a checkout update makes it stale: `install` refreshes it, `check` must not alarm
-        Action("passkey-qr-health.timer repairs hung services and flags an offline proxy every 45 s",
-               health_timer_ok, enable_health_timer),
+        Action("passkey-qr-watch.service repairs the chain and flags Home Assistant/ESP32 problems only while a "
+               "passkey request is pending (no timer, no polling)", watch_ok, enable_watch),
+        Action("the old 45 s passkey-qr-health.timer is gone (it polled Home Assistant while idle)",
+               obsolete_units_gone, remove_obsolete_units),
         Action("Firefox prefs are re-applied after a profile change (passkey-qr-prefs.path)", prefs_path_ok,
                enable_prefs_path),
     ]
@@ -1618,7 +1666,9 @@ def notify(title: str, body: str, *, urgent: bool = False) -> None:
         return
     try:
         result = subprocess.run([exe, "-a", "passkey-qr", "-u", "critical" if urgent else "normal",
-                                 "-i", "dialog-warning" if urgent else "dialog-information", title, body],
+                                 "-i", "dialog-warning" if urgent else "dialog-information",
+                                 "-h", "string:x-canonical-private-synchronous:passkey-qr",  # one box: the update replaces it
+                                 title, body],
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as err:
         hlog(f"notify-send failed: {err}", 4)
@@ -1658,28 +1708,29 @@ def may_act(state: dict, key: str, now: float, cooldown: float) -> bool:
 
 def report(state: dict, key: str, ok: bool, now: float, *, up: tuple[str, str],
            down: tuple[str, str] | None = None) -> None:
-    """One desktop notification per outage of ``key``: after HEALTH_CONFIRM_RUNS failing runs, a reminder
-    every HEALTH_REMIND_SECONDS, a 'recovered' one when it ends; an outage right after a recovery is a flap
-    and stays in the journal only."""
+    """The user hears about ``key`` only while a passkey request is pending (``state["pending"]``): once when it
+    fails, never more often than every NOTIFY_MIN_SECONDS however often requests retry, and 'recovered' only for
+    a request that was told about it. Without a pending request (a manual run) it is journal only."""
     entry = state.setdefault("issues", {}).setdefault(key, {})
     if ok:
-        if entry.get("notified"):
+        if entry.get("open"):
             notify(*up)
-            entry["recovered_at"] = now
         elif entry.get("fails"):
             hlog(f"{key}: ok again")
-        entry["fails"], entry["notified"] = 0, 0
+        entry["open"], entry["fails"] = False, 0
         return
     assert down, "a failing report needs its notification text"
     entry["fails"] = entry.get("fails", 0) + 1
     hlog(f"{key}: FAILING ({entry['fails']}x): {down[0]}", 4)
-    if entry["fails"] < HEALTH_CONFIRM_RUNS:
+    if not state.get("pending") or entry.get("open"):
         return
-    first = not entry.get("notified")
-    flapping = now - entry.get("recovered_at", 0) < HEALTH_COOLDOWN_SECONDS
-    if (first and not flapping) or (not first and now - entry["notified"] >= HEALTH_REMIND_SECONDS):
-        notify(*down, urgent=True)
-        entry["notified"] = now
+    entry["open"] = True  # this request knows about it, repeated or not: it hears when it is over
+    told = entry.get("told")
+    if told is not None and 0 <= now - told < NOTIFY_MIN_SECONDS:
+        hlog(f"{key}: the user was told {now - told:.0f} s ago: not repeating")
+        return
+    notify(*down, urgent=True)
+    entry["told"] = now
 
 
 def session_ready() -> bool:
@@ -1750,42 +1801,183 @@ def health_bluetooth(state: dict, now: float) -> None:
                      "The ha-ble-vhci bridge registered no adapter, so the passkey QR dialog hangs. "
                      "See: journalctl --user -u ha-ble-vhci"))
     if needs_bridge:
-        health_proxy(state, now)
+        if state.get("pending"):  # Home Assistant is only ever asked on behalf of a request that is waiting
+            health_proxy(state, now)
     else:  # a real adapter (or no bridge): an old outage must not carry over to the next time the bridge is needed
         for key in ("bluetooth-proxy", "bluetooth-adapter") if not bt_adapters() else ("bluetooth-proxy",):
             state.get("issues", {}).pop(key, None)
 
 
-def health_proxy(state: dict, now: float) -> None:
-    up = ("Bluetooth proxy is back online", "Passkey QR works again: Home Assistant sees the ESP32.")
+def scanner_query() -> tuple[int | None, str]:
+    """Exit code of the bridge's ``--scanners`` and the last line it said on stderr (None: it cannot be asked)."""
     fake = os.environ.get("PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT", "").strip()  # test/demo seam: pretend the exit code
     if fake.isdigit():
-        code: int | None = int(fake)
-    else:
-        result = scanners_result()
-        code = None if result is None else result.returncode
-        if code == 1 and "Traceback" in (result.stderr or ""):
-            code = 70  # the bridge itself crashed: that says nothing about Home Assistant
-    if code is None or code not in (0, 1, 4):
+        return int(fake), os.environ.get("PASSKEY_QR_HEALTH_FAKE_SCANNERS_REASON", "").strip()
+    result = scanners_result()
+    if result is None:
+        return None, ""
+    if result.returncode == 1 and "Traceback" in (result.stderr or ""):
+        return 70, ""  # the bridge itself crashed: that says nothing about Home Assistant
+    lines = (result.stderr or "").strip().splitlines()
+    return result.returncode, lines[-1].strip() if lines else ""
+
+
+def ha_reason(detail: str) -> str:
+    """What the bridge's one-line complaint means, in words for someone who is just trying to sign in."""
+    low = detail.lower()
+    for needles, words in (
+        (("connect call failed", "connection refused"), "nothing answers on its port (it is restarting or stopped)"),
+        (("name or service not known", "temporary failure in name resolution", "nodename nor servname"),
+         "its host name does not resolve (network or DNS is down)"),
+        (("network is unreachable", "no route to host"), "the network is unreachable"),
+        (("closed the connection", "dropped the connection", "server disconnected"),
+         "it dropped the connection (it is restarting)"),
+        (("timed out", "timeout", "did not answer"), "no answer in time (network down or Home Assistant overloaded)"),
+    ):
+        if any(needle in low for needle in needles):
+            return words
+    return re.sub(r"^cannot reach Home Assistant at \S+: ", "", detail)[:120] or "no answer"
+
+
+SAFE_SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]*")
+SAFE_CONTAINER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def ha_repair_target() -> tuple[str, str] | None:
+    """(ssh host, container name) of the user's own Home Assistant, from ~/.config/passkey-qr/ha-repair
+    (HA_SSH_HOST defaults to the host of the configured Home Assistant URL). None: no repair is configured."""
+    values = dict(re.findall(r"^(HA_SSH_HOST|HA_CONTAINER)=(\S+)[ \t]*$", read_text(HA_REPAIR_CONFIG) or "", re.M))
+    host = values.get("HA_SSH_HOST") or urllib.parse.urlparse(ha_url_configured() or "").hostname
+    container = values.get("HA_CONTAINER")
+    if host and container and SAFE_SSH_HOST.fullmatch(host) and SAFE_CONTAINER.fullmatch(container):
+        return host, container
+    return None
+
+
+def docker_time(text: str) -> float:
+    """Docker's RFC 3339 timestamp (nanoseconds, Z) as epoch seconds; 0.0 when it has none ('0001-01-01...')."""
+    match = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z", text)
+    if not match or text.startswith("0001-"):
+        return 0.0
+    return calendar.timegm(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")) + float("0" + (match.group(2) or ""))
+
+
+def ssh_docker(host: str, *words: str, timeout: float = 25) -> subprocess.CompletedProcess | None:
+    """``docker <words>`` on the user's own server over the SSH access that already works without a password
+    (BatchMode: it never asks, never trusts an unknown host key). None when ssh itself cannot be run."""
+    remote = "docker " + " ".join(shlex.quote(word) for word in words)
+    try:
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, remote],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def ha_container_info(host: str, container: str) -> dict | None:
+    fmt = "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|" \
+          "{{.State.StartedAt}}|{{.State.FinishedAt}}"
+    result = ssh_docker(host, "inspect", "--format", fmt, container)
+    parts = (result.stdout.strip().split("|") if result is not None and result.returncode == 0 else [])
+    if len(parts) != 4:
+        return None
+    return {"status": parts[0], "health": parts[1], "started": docker_time(parts[2]), "finished": docker_time(parts[3])}
+
+
+def ha_container_plan(info: dict, now: float, down_for: float) -> tuple[str, str]:
+    """``(action, what we found)``. Only a container that is not running, or one that stays unhealthy AND
+    unreachable for minutes, is touched: a Home Assistant core restart (minutes of 'unreachable' with the
+    container up and healthy or booting) is somebody's deliberate action and is never fought."""
+    status, health = info["status"], info["health"]
+    if status in ("exited", "dead", "created"):
+        if status == "exited" and 0 <= now - info["finished"] < HA_RESTART_POLICY_GRACE_SECONDS:
+            return "wait", "its container has just stopped and Docker is bringing it back"
+        return "start", "its container was stopped"
+    if status == "paused":
+        return "unpause", "its container was paused"
+    if status != "running":
+        return "wait", f"its container is {status}"
+    age = now - info["started"]
+    if 0 <= age < HA_BOOT_GRACE_SECONDS:
+        return "wait", f"its container started {age / 60:.0f} min ago and Home Assistant is still booting"
+    if health == "unhealthy" and down_for >= HA_HUNG_SECONDS:
+        return "restart", f"its container has been unhealthy and unreachable for {down_for / 60:.0f} min"
+    if health == "unhealthy":
+        return "wait", "its container is unhealthy (it is restarted if that lasts)"
+    return "wait", "its container is running, so Home Assistant itself is restarting or the network is slow"
+
+
+def note_ha_down(state: dict, now: float) -> float:
+    """How long Home Assistant has been continuously unreachable as seen by passes of requests: observations
+    further apart than HA_DOWN_GAP_SECONDS belong to different outages."""
+    down = state.get("ha_down") or {}
+    if not down or not 0 <= now - down.get("last", 0) <= HA_DOWN_GAP_SECONDS:
+        down = {"since": now}
+    down["last"] = now
+    state["ha_down"] = down
+    return now - down["since"]
+
+
+def ha_repair(state: dict, now: float, down_for: float) -> str:
+    """Home Assistant is unreachable while a request waits: look at its container over the user's own SSH access
+    and start/unpause/restart it when that is what is wrong. Returns a sentence for the notification ('' when
+    nothing is configured). Journal lines say exactly what was done."""
+    target = ha_repair_target()
+    if target is None or not may_act(state, "ha-inspect", now, HA_INSPECT_COOLDOWN):
+        return ""
+    host, container = target
+    info = ha_container_info(host, container)
+    if info is None:
+        hlog(f"cannot look at {container} on {host} over ssh (no passwordless access?): not repairing", 4)
+        return f"Could not look at it on {host} over SSH. "
+    action, found = ha_container_plan(info, now, down_for)
+    said = found[0].upper() + found[1:]
+    if action != "wait" and not may_act(state, "ha-repair", now, HA_REPAIR_COOLDOWN):
+        hlog(f"{container} on {host}: {found}; it was repaired less than {HA_REPAIR_COOLDOWN // 60} min ago: waiting", 4)
+        return f"{said}. "
+    if action == "wait":
+        hlog(f"{container} on {host}: {found}: leaving it alone")
+        return f"{said}. "
+    hlog(f"{container} on {host}: {found}: running `docker {action}` there", 4)
+    result = None if DRY_RUN else ssh_docker(host, action, container, timeout=HA_ACTION_TIMEOUT_SECONDS)
+    if not DRY_RUN and (result is None or result.returncode != 0):
+        hlog(f"`docker {action} {container}` on {host} failed: {(result.stderr if result else '').strip()[:200]}", 4)
+        return f"{said}; repairing it did not work (see the journal). "
+    return f"{said}: it was {ACTION_DONE[action]}. "
+
+
+def health_proxy(state: dict, now: float) -> None:
+    up = ("Bluetooth proxy is back online", "Passkey QR works again: Home Assistant sees the ESP32.")
+    code, detail = scanner_query()
+    if code == EXIT_UNREACHABLE and not ha_reason(detail).startswith("no answer in time"):
+        time.sleep(PROBE_RETRY_SECONDS)  # a blip is not an outage: look once more before the user is told
+        code, detail = scanner_query()  # (a query that already waited for its timeout is not asked a second time)
+    if code is None or code not in (0, 1, EXIT_NO_SCANNER, EXIT_UNREACHABLE):
         # Home Assistant is not configured, the bridge did not answer in time or is too old for --scanners
         # (argparse exit 2): nothing trustworthy to compare against, and not Home Assistant's fault
         if code is not None:
             hlog(f"ha-ble-vhci --scanners exited {code}: cannot tell whether a proxy is online", 4)
         return
+    if code != EXIT_UNREACHABLE:
+        state.pop("ha_down", None)  # Home Assistant answered
     if code == 0:
         report(state, "bluetooth-proxy", True, now, up=up)
         if scanner_log_says_none(now) and may_act(state, "bridge-stale-scanner", now, BRIDGE_RESTART_COOLDOWN):
             hlog("Home Assistant sees a scanner but the bridge says 'none' for a while: restarting ha-ble-vhci", 4)
             restart_unit("ha-ble-vhci")
         return
-    if code == 4:
+    if code == EXIT_NO_SCANNER:
         down = ("Bluetooth proxy (ESP32) is offline",
-                "Home Assistant has no Bluetooth proxy online, so the passkey QR dialog will hang. "
-                "Power on or reconnect the ESP32; this repairs itself once it is back.")
-    else:
+                "Home Assistant has no Bluetooth proxy online, so the passkey QR dialog cannot see your phone. "
+                "If Home Assistant has just restarted the ESP32 is back within a minute or two; otherwise power "
+                "it on or reconnect it. You are told when it is back.")
+    elif code == EXIT_UNREACHABLE:
+        seen = ha_repair(state, now, note_ha_down(state, now))
         down = ("Home Assistant is unreachable",
-                f"Cannot reach Home Assistant ({ha_url_configured() or 'URL not set'}; scanner query exit {code}), "
-                "so the passkey QR dialog will hang. Check that it is running and the network is up.")
+                f"The passkey QR dialog cannot see your phone until Home Assistant ({ha_url_configured() or 'URL not set'}) "
+                f"answers: {ha_reason(detail)}. {seen}It repairs itself; you are told when it is back.")
+    else:
+        down = ("Home Assistant refuses the passkey bridge",
+                f"{detail or 'it answered with an error'}. Check the admin token in ~/.config/ha-ble-vhci/token.")
     report(state, "bluetooth-proxy", False, now, down=down, up=up)
 
 
@@ -1881,20 +2073,28 @@ def health_stuck_requests(state: dict, now: float) -> None:
     if any(pid not in {p for p, _ in stuck} for pid, _ in helpers):
         hlog("another passkey request is in progress: restarting credentialsd after it ends")
         return
+    restart_credentialsd(state)
+
+
+def restart_credentialsd(state: dict) -> None:
     for unit in loaded_units(CREDENTIALSD_UNITS):
         run(["systemctl", "--user", "restart", unit], check=False)
     state["restart_credentialsd"] = False
 
 
 def health(now: float | None = None) -> int:
+    """One pass over the chain for a passkey request that is pending right now (see ``serve_request``): the only
+    place that asks Home Assistant and the only one whose findings may reach the user."""
     now = time.time() if now is None else now
     state = load_health_state()
+    state["pending"] = True
     graphical = session_ready()  # the portal and credentialsd only live inside the graphical session
     if not graphical:
         hlog("no graphical session (no graphical-session.target, no display in the user manager): the portal and "
              "credentialsd checks are skipped")
-    # the stuck-request cleanup comes first: it is the cheapest check and the one a hung portal must not starve
-    checks = [health_stuck_requests, health_bluetooth, *([health_portal, health_credentialsd] if graphical else [])]
+    # the stuck-request cleanup comes first: it is the cheapest check and the one a hung portal must not starve;
+    # the bluetooth check goes last because it is the only one that can wait on the network (Home Assistant)
+    checks = [health_stuck_requests, *([health_portal, health_credentialsd] if graphical else []), health_bluetooth]
     failed = False
     for check in checks:
         try:
@@ -1902,27 +2102,175 @@ def health(now: float | None = None) -> int:
         except Exception:  # one broken check must not stop the others
             hlog(f"{check.__name__} crashed:\n{traceback.format_exc()}", 3)
             failed = True
-        save_health_state(state)  # after every check: a run cut off by TimeoutStartSec keeps what it learned
+        save_health_state(state)  # after every check: a run cut off by a stop keeps what it learned
     return 1 if failed else 0
 
 
+def pending_helpers() -> list[tuple[int, int]]:
+    """``(pid, age)`` of the Firefox native-messaging helpers alive right now: one per passkey request that is
+    still waiting for its answer (it exits when the request ends)."""
+    return stuck_helpers(0)
+
+
+def mark_request(pending: bool) -> None:
+    """The marker file other tools (and ``status``) can look at: it exists exactly while a request is served."""
+    if DRY_RUN:
+        return
+    try:
+        if pending:
+            REQUEST_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            REQUEST_MARKER.write_text(json.dumps({"since": time.time(), "pid": os.getpid()}))
+        else:
+            REQUEST_MARKER.unlink(missing_ok=True)
+    except OSError as err:
+        hlog(f"cannot update {REQUEST_MARKER}: {err}", 4)
+
+
+def end_request() -> None:
+    """The request is over: what was told during it is settled, so a later request starts from scratch, and a
+    credentialsd restart that waited for the other requests (see health_stuck_requests) is done now."""
+    state = load_health_state()
+    state["pending"] = False
+    for entry in state.get("issues", {}).values():
+        entry["open"], entry["fails"] = False, 0
+    state.pop("ha_down", None)
+    if state.get("restart_credentialsd") and not pending_helpers():
+        hlog("the last passkey request ended: restarting credentialsd after the stuck one")
+        restart_credentialsd(state)
+    save_health_state(state)
+
+
+def serve_request(sleep: Callable[[float], None] = time.sleep) -> None:
+    """A passkey request is pending: check the chain now and every REQUEST_CHECK_SECONDS for as long as a Firefox
+    helper still waits for its answer. A pass is only started while the request is still alive, so one that
+    ended during the wait costs nothing and tells nobody."""
+    hlog("passkey request pending: checking the chain")
+    mark_request(True)
+    try:
+        with pass_lock(wait=True):
+            health()
+        while pending_helpers():
+            sleep(REQUEST_CHECK_SECONDS)
+            if pending_helpers():
+                with pass_lock(wait=True):
+                    health()
+    finally:
+        mark_request(False)
+        with pass_lock(wait=True):
+            end_request()
+    hlog("passkey request over: nothing is checked until the next one")
+
+
+@contextlib.contextmanager
+def pass_lock(wait: bool) -> Iterator[bool]:
+    """Health passes (the watcher's and a manual `health`) share cooldowns and one state file: one at a time.
+    Yields True when held, False when ``wait`` is off and another pass holds it."""
+    try:
+        PASS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(PASS_LOCK, "a")
+    except OSError as err:  # no runtime directory: a pass without the lock beats no pass
+        hlog(f"cannot open {PASS_LOCK}: {err}", 4)
+        yield True
+        return
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        handle.close()  # releases the lock
+
+
+def request_call_time(line: str) -> float | None:
+    """Epoch seconds of a ``busctl monitor --json`` line that may start a passkey request: a call to the portal that
+    creates or gets a credential, or the earlier registration of Firefox's app id that the helper makes first
+    (a hung portal never gets as far as the credential call). The caller still checks that a helper is alive."""
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(message, dict) or message.get("type") != "method_call" or message.get("destination") != PORTAL_NAME:
+        return None
+    interface, member = message.get("interface"), message.get("member")
+    data = (message.get("payload") or {}).get("data") if isinstance(message.get("payload"), dict) else None
+    firefox_registers = (interface == REGISTRY_INTERFACE and member == "Register"
+                         and isinstance(data, list) and data[:1] == [FIREFOX_APP_ID])
+    if not (firefox_registers or (interface == REQUEST_INTERFACE and member in REQUEST_MEMBERS)):
+        return None
+    stamp = message.get("timestamp-realtime")
+    return stamp / 1e6 if isinstance(stamp, (int, float)) else time.time()
+
+
+def cmd_watch(_: argparse.Namespace) -> None:
+    """Run by passkey-qr-watch.service. Blocks on the session bus, so it costs nothing while idle: no timer, no
+    Home Assistant query, no notification. A portal call that comes from Firefox's helper starts
+    ``serve_request``; the monitor is attached before anything else so no request can slip in between."""
+    mark_request(False)  # a marker left behind by a killed run
+    monitor = subprocess.Popen(["busctl", "--user", "monitor", "--json=short",
+                                *[arg for rule in REQUEST_MATCHES for arg in ("--match", rule)]],
+                               stdout=subprocess.PIPE, text=True)
+    hlog("watching the session bus for passkey requests: nothing is checked until one arrives")
+    handled_until = 0.0
+    if pending_helpers():  # a request was already waiting when the watcher (re)started
+        serve_request()
+        handled_until = time.time()
+    assert monitor.stdout
+    for line in monitor.stdout:
+        asked = request_call_time(line)
+        if asked is None or asked < handled_until:  # not a request, or one made while the last one was served
+            continue
+        time.sleep(REQUEST_SETTLE_SECONDS)  # whatever called the portal must have a Firefox helper behind it
+        if pending_helpers():
+            serve_request()
+        else:
+            hlog("a portal call without a Firefox helper behind it: not a passkey request")
+        handled_until = time.time()
+    sys.exit(f"busctl monitor ended (exit {monitor.wait()}): systemd restarts the watcher")
+
+
 def cmd_health(_: argparse.Namespace) -> None:
-    """Run by passkey-qr-health.timer. Exit 1 only when a check itself crashed."""
-    sys.exit(health())
+    """One pass now, but only for a pending request: with none, nothing is queried and nobody is told. The
+    watcher serving the request already does this by itself, so it is not duplicated. Exit 1 only when a check
+    itself crashed."""
+    if not pending_helpers():
+        hlog("no passkey request is pending: nothing to check")
+        return
+    if REQUEST_MARKER.exists():
+        hlog("the watcher is serving this request already: nothing to do")
+        return
+    with pass_lock(wait=False) as held:
+        if not held:
+            hlog("another health pass is running: nothing to do")
+            return
+        failed = health()
+        end_request()
+    sys.exit(failed)
+
+
+def show_request_status() -> None:
+    try:
+        since = json.loads(REQUEST_MARKER.read_text()).get("since")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        say("\n  passkey request: none pending (nothing is being checked)")
+        return
+    say(f"\n  passkey request: pending since {time.strftime('%H:%M:%S', time.localtime(since))}"
+        if isinstance(since, (int, float)) else "\n  passkey request: pending")
 
 
 def cmd_heal_prefs(_: argparse.Namespace) -> None:
-    """Run by passkey-qr-prefs.path and at login: re-apply only the managed user.js block when it drifted."""
+    """Run by passkey-qr-prefs.path and at login: re-apply only the managed user.js block when it drifted.
+    Journal only: nobody is using a passkey right now, so nobody is notified."""
     if not managed_profiles():
         hlog("no Firefox profile to manage yet")
         return
     if usb_token_off_ok():
         hlog("Firefox prefs are in place")
         return
-    hlog("Firefox prefs drifted (a Firefox update or a new profile dropped the user.js block): re-applying", 4)
+    hlog("Firefox prefs drifted (a Firefox update or a new profile dropped the user.js block): re-applying; "
+         "they take effect at the next Firefox start", 4)
     disable_usb_token()
-    notify("Firefox passkey settings were re-applied",
-           "A Firefox update or profile change had removed them. Restart Firefox once for them to take effect.")
 
 
 # --------------------------------------------------------------------------- steps
@@ -1960,9 +2308,10 @@ def step_extension() -> bool:
 
 
 def step_selfheal() -> bool:
-    return run_actions("6. Self-healing (restart policy, health check, Firefox prefs)", selfheal_actions(),
-                       "  Every link of the chain restarts on its own; a timer repairs hung ones and tells you\n"
-                       "  on the desktop when the Bluetooth proxy (ESP32) is offline.")
+    return run_actions("6. Self-healing (restart policy, request watcher, Firefox prefs)", selfheal_actions(),
+                       "  Every link of the chain restarts on its own. While you do NOT use passkeys nothing runs and\n"
+                       "  nothing is checked; when a passkey request starts, a watcher repairs what is hung and tells\n"
+                       "  you on the desktop (once) if Home Assistant or the Bluetooth proxy (ESP32) is down.")
 
 
 STEPS = [step_packages, step_firefox, step_bluetooth, step_credentialsd, step_extension, step_selfheal]
@@ -1992,6 +2341,7 @@ def cmd_status(_: argparse.Namespace) -> None:
     missing = missing_apt()
     if missing:
         say("\n  missing packages: " + " ".join(missing))
+    show_request_status()
 
 
 def status_rows() -> list[tuple[str, bool, bool]]:
@@ -2120,7 +2470,10 @@ def main() -> None:
     sub.add_parser("check", help="exit 0 when everything required is in place, 3 otherwise (read-only)"
                    ).set_defaults(func=cmd_check)
     sub.add_parser("install", help="apply everything that is missing").set_defaults(func=cmd_install)
-    sub.add_parser("health", help="one self-healing pass (run every 45 s by passkey-qr-health.timer)"
+    sub.add_parser("watch", help="block on the session bus and check/repair the passkey chain only while a passkey "
+                   "request is pending (run by passkey-qr-watch.service; no timer, no polling)"
+                   ).set_defaults(func=cmd_watch)
+    sub.add_parser("health", help="one check/repair pass now, only if a passkey request is pending (else it does nothing)"
                    ).set_defaults(func=cmd_health)
     sub.add_parser("heal-prefs", help="re-apply the Firefox user.js block if it drifted (run by passkey-qr-prefs.path)"
                    ).set_defaults(func=cmd_heal_prefs)

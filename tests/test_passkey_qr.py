@@ -5,9 +5,11 @@ Nothing here touches the system: commands go through a recording `run`, Bluetoot
 temporary directory (PASSKEY_QR_BLUETOOTH_DIR) and HOME is a temporary directory.
 """
 
+import calendar
 import dataclasses
 import importlib.machinery
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -1055,11 +1057,19 @@ class SelfHealingBase(Base):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.patched(SYSTEMD_USER=self.root / "systemd", HEALTH_BIN=self.root / "libexec/passkey-qr",
-                     HEALTH_STATE=self.root / "state/health.json", STATE_DIR=self.root / "state")
+                     HEALTH_STATE=self.root / "state/health.json", STATE_DIR=self.root / "state",
+                     REQUEST_MARKER=self.root / "run/passkey-qr/request-pending",
+                     PASS_LOCK=self.root / "run/passkey-qr/pass.lock",
+                     HA_REPAIR_CONFIG=self.root / "config/passkey-qr/ha-repair", PROBE_RETRY_SECONDS=0)
         self.answers = {"systemctl --user is-enabled": "enabled"}
         self.patched(out=self.fake_out)
-        self.notices = []
-        self.patched(notify=lambda title, body, urgent=False: self.notices.append((title, urgent)))
+        self.notices, self.bodies = [], []
+        self.patched(notify=self.record_notice)
+        self.real_ssh_docker = pq.ssh_docker
+
+    def record_notice(self, title, body, urgent=False):
+        self.notices.append((title, urgent))
+        self.bodies.append(body)
 
     def fake_out(self, cmd, timeout=20):
         for prefix, answer in self.answers.items():
@@ -1160,23 +1170,30 @@ class SelfHealingStep(SelfHealingBase):
         self.patched(SELF=self.root / "passkey-qr")
         pq.SELF.write_text("#!/usr/bin/env python3\n")
         self.loaded("ha-ble-vhci")
+        self.old_units()
         self.answers.update({"systemctl --user is-enabled": "enabled", "systemctl --user is-active": "active"})
         self.assertFalse(any(a.check() for a in pq.selfheal_actions()))
         for action in pq.selfheal_actions():
             action.apply()
         self.assertTrue(all(a.check() for a in pq.selfheal_actions()))
-        self.assertIn(["systemctl", "--user", "enable", "--now", "passkey-qr-health.timer"], self.rec.commands)
+        self.assertIn(["systemctl", "--user", "enable", "passkey-qr-watch.service"], self.rec.commands)
+        self.assertIn(["systemctl", "--user", "restart", "passkey-qr-watch.service"], self.rec.commands)
         self.assertIn(["systemctl", "--user", "enable", "--now", "passkey-qr-prefs.path"], self.rec.commands)
-        timer = (pq.SYSTEMD_USER / "passkey-qr-health.timer").read_text()
-        self.assertRegex(timer, r"OnUnitActiveSec=(30|4\d|5\d|60)s")
-        service = (pq.SYSTEMD_USER / "passkey-qr-health.service").read_text()
-        self.assertIn(f'ExecStart="{pq.HEALTH_BIN}" health', service)
+        service = (pq.SYSTEMD_USER / "passkey-qr-watch.service").read_text()
+        self.assertIn(f'ExecStart="{pq.HEALTH_BIN}" watch', service)
+        self.assertFalse(list(pq.SYSTEMD_USER.glob("*.timer")))  # not one timer is installed
         self.assertEqual(pq.HEALTH_BIN.stat().st_mode & 0o777, 0o755)
+
+    def old_units(self):
+        """What an earlier version installed: the 45 s timer and its service."""
+        pq.SYSTEMD_USER.mkdir(parents=True, exist_ok=True)
+        for name in pq.OBSOLETE_UNITS:
+            (pq.SYSTEMD_USER / name).write_text("[Unit]\nDescription=old\n")
 
     def test_units_survive_a_home_with_a_space_or_a_percent_sign(self):
         self.patched(HEALTH_BIN=Path("/home/a b/100%/passkey-qr"))
-        service = pq.health_unit_files()[pq.SYSTEMD_USER / "passkey-qr-health.service"]
-        self.assertIn('ExecStart="/home/a b/100%%/passkey-qr" health', service)
+        service = pq.watch_unit_files()[pq.SYSTEMD_USER / "passkey-qr-watch.service"]
+        self.assertIn('ExecStart="/home/a b/100%%/passkey-qr" watch', service)
 
     def test_the_path_unit_watches_both_firefox_profile_lists(self):
         text = pq.prefs_unit_files()[pq.SYSTEMD_USER / "passkey-qr-prefs.path"]
@@ -1196,85 +1213,105 @@ class SelfHealingStep(SelfHealingBase):
     def test_dry_run_changes_nothing(self):
         self.set_flags(dry_run=True)
         self.loaded("ha-ble-vhci")
+        self.old_units()
         for action in pq.selfheal_actions():
             action.apply()
         self.assertFalse(pq.HEALTH_BIN.exists())
-        self.assertFalse(pq.SYSTEMD_USER.exists())
+        self.assertEqual(sorted(p.name for p in pq.SYSTEMD_USER.iterdir()),
+                         ["passkey-qr-health.service", "passkey-qr-health.timer"])  # nothing written, nothing removed
+
+    def test_the_installer_removes_the_45_second_timer_it_used_to_install(self):
+        self.old_units()
+        self.assertFalse(pq.obsolete_units_gone())
+        pq.remove_obsolete_units()
+        self.assertTrue(pq.obsolete_units_gone())
+        self.assertEqual(self.commands_starting("systemctl", "--user", "disable", "--now"),
+                         [["systemctl", "--user", "disable", "--now", "passkey-qr-health.timer"]])
+
+    def test_a_refreshed_copy_restarts_the_running_watcher(self):
+        self.patched(SELF=self.root / "passkey-qr")
+        pq.SELF.write_text("v2")
+        (pq.SYSTEMD_USER).mkdir(parents=True)
+        (pq.SYSTEMD_USER / "passkey-qr-watch.service").write_text("[Service]\n")
+        pq.install_health_copy()
+        self.assertIn(["systemctl", "--user", "try-restart", "passkey-qr-watch.service"], self.rec.commands)
+
+    def test_the_first_install_does_not_try_to_restart_a_watcher_that_does_not_exist_yet(self):
+        self.patched(SELF=self.root / "passkey-qr")
+        pq.SELF.write_text("v1")
+        pq.install_health_copy()
+        self.assertEqual(self.commands_starting("systemctl"), [])
 
 
 class OfflineProxyNotification(SelfHealingBase):
-    """`--scanners` exit 4 (no proxy) / 1 (Home Assistant down) -> ONE desktop notification per outage."""
+    """`--scanners` exit 4 (no proxy) / 5 (Home Assistant unreachable) while a passkey request is pending ->
+    ONE desktop notification per failure; never without a pending request."""
 
     def setUp(self):
         super().setUp()
-        self.patched(scanner_log_says_none=lambda now: False)
+        self.patched(scanner_log_says_none=lambda now: False, ha_repair=lambda state, now, down_for: "")
 
-    def pass_with(self, code, now):
+    def pass_with(self, code, now, *, pending=True, reason=""):
         state = pq.load_health_state()
-        with mock.patch.dict(os.environ, {"PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT": str(code)}):
+        state["pending"] = pending
+        env = {"PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT": str(code), "PASSKEY_QR_HEALTH_FAKE_SCANNERS_REASON": reason}
+        with mock.patch.dict(os.environ, env):
             pq.health_proxy(state, now)
         pq.save_health_state(state)
 
-    def test_one_failing_run_is_a_blip_two_are_an_outage_and_it_is_said_once(self):
+    def test_a_missing_proxy_is_told_once_however_often_the_request_is_rechecked(self):
         self.pass_with(4, 1000)
-        self.assertEqual(self.notices, [])
-        self.pass_with(4, 1045)
         self.assertEqual(self.notices, [("Bluetooth proxy (ESP32) is offline", True)])
-        for tick in range(3, 20):
-            self.pass_with(4, 1000 + 45 * tick)
+        for tick in range(1, 20):
+            self.pass_with(4, 1000 + 20 * tick)
         self.assertEqual(len(self.notices), 1)
 
-    def test_the_outage_is_repeated_after_the_reminder_interval(self):
-        self.pass_with(4, 1000)
-        self.pass_with(4, 1045)
-        self.pass_with(4, 1045 + pq.HEALTH_REMIND_SECONDS + 1)
-        self.assertEqual([title for title, _ in self.notices], ["Bluetooth proxy (ESP32) is offline"] * 2)
+    def test_idle_runs_tell_nobody(self):
+        for tick in range(10):
+            self.pass_with(4, 1000 + 45 * tick, pending=False)
+            self.pass_with(5, 1000 + 45 * tick, pending=False)
+        self.assertEqual(self.notices, [])
+        self.assertIn("bluetooth-proxy: FAILING", self.rec.text)
 
     def test_recovery_is_announced_exactly_once(self):
         self.pass_with(4, 1000)
-        self.pass_with(4, 1045)
-        self.pass_with(0, 1090)
-        self.pass_with(0, 1135)
+        self.pass_with(0, 1020)
+        self.pass_with(0, 1040)
         self.assertEqual(self.notices, [("Bluetooth proxy (ESP32) is offline", True),
                                         ("Bluetooth proxy is back online", False)])
 
-    def test_a_blip_that_was_never_announced_is_not_announced_as_recovered(self):
-        self.pass_with(4, 1000)
-        self.pass_with(0, 1045)
+    def test_a_proxy_that_was_never_missing_is_never_announced_as_back(self):
+        self.pass_with(0, 1000)
         self.assertEqual(self.notices, [])
 
-    def test_an_outage_right_after_a_recovery_is_a_flap_and_stays_quiet(self):
-        for now, code in ((1000, 4), (1045, 4), (1090, 0), (1135, 4), (1180, 4), (1225, 4)):
-            self.pass_with(code, now)
-        self.assertEqual(len(self.notices), 2)  # offline, recovered; the flap is not announced again
-        self.pass_with(4, 1090 + pq.HEALTH_COOLDOWN_SECONDS + 100)
-        self.assertEqual(len(self.notices), 3)
-
     def test_home_assistant_down_is_told_differently_from_a_missing_proxy(self):
-        self.pass_with(1, 1000)
-        self.pass_with(1, 1045)
+        self.pass_with(5, 1000)
         self.assertEqual(self.notices, [("Home Assistant is unreachable", True)])
 
     def test_nothing_is_reported_when_the_bridge_is_not_set_up(self):
         self.patched(scanners_result=lambda: None)
-        state = {}
+        state = {"pending": True}
         pq.health_proxy(state, 1000)
-        pq.health_proxy(state, 1045)
-        self.assertEqual((self.notices, state), ([], {}))
+        self.assertEqual((self.notices, state), ([], {"pending": True}))
 
     def test_the_real_exit_code_is_used_without_the_override(self):
         self.patched(scanners_result=lambda: subprocess.CompletedProcess([], 4, "", ""))
-        state = {}
-        pq.health_proxy(state, 1000)
-        pq.health_proxy(state, 1045)
+        pq.health_proxy({"pending": True}, 1000)
         self.assertEqual(len(self.notices), 1)
+
+    def test_the_real_unreachable_exit_code_and_stderr_reach_the_message(self):
+        said = "cannot reach Home Assistant at http://x:8123: Cannot connect to host x:8123 [Connect call failed]"
+        self.patched(scanners_result=lambda: subprocess.CompletedProcess([], 5, "", said + "\n"))
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual(self.notices, [("Home Assistant is unreachable", True)])
+        self.assertIn("nothing answers on its port", self.bodies[0])
 
     def test_a_bridge_that_says_none_while_home_assistant_sees_a_scanner_is_restarted_once(self):
         self.patched(scanners_result=lambda: subprocess.CompletedProcess([], 0, "p  source=1\n", ""),
                      scanner_log_says_none=lambda now: True)
-        state = {}
+        state = {"pending": True}
         pq.health_proxy(state, 1000)
-        pq.health_proxy(state, 1045)  # inside the cooldown
+        pq.health_proxy(state, 1020)  # inside the cooldown
         self.assertEqual(self.commands_starting("systemctl", "--user", "restart", "ha-ble-vhci"),
                          [["systemctl", "--user", "restart", "ha-ble-vhci"]])
 
@@ -1300,6 +1337,7 @@ class DesktopNotification(Base):
         self.assertEqual(argv[0], "/usr/bin/notify-send")
         self.assertEqual(argv[argv.index("-u") + 1], "critical")
         self.assertEqual(argv[-2:], ["Bluetooth proxy (ESP32) is offline", "Power it on."])
+        self.assertEqual(argv[argv.index("-h") + 1], "string:x-canonical-private-synchronous:passkey-qr")
         self.assertIn("notify: Bluetooth proxy (ESP32) is offline", self.rec.text)  # and the journal line
 
     def test_a_missing_notify_send_is_logged_not_raised(self):
@@ -1361,6 +1399,23 @@ class StuckRequests(SelfHealingBase):
         pq.health_stuck_requests(state, 135)
         self.assertEqual(len(self.commands_starting("systemctl", "--user", "restart")), 2)  # once, not forever
 
+    def test_a_restart_that_waited_for_a_younger_request_is_done_when_the_last_request_ends(self):
+        with mock.patch.object(pq.os, "kill"):
+            pq.save_health_state({"restart_credentialsd": True})
+            self.answers["ps -u"] = "  101   60 /usr/bin/python3 /usr/local/bin/credentialsd-firefox-helper\n"
+            pq.end_request()  # a request is still alive: not now
+            self.assertEqual(self.commands_starting("systemctl", "--user", "restart"), [])
+            self.assertTrue(pq.load_health_state()["restart_credentialsd"])
+            self.answers["ps -u"] = ""
+            pq.end_request()  # the last one is gone
+        self.assertEqual(len(self.commands_starting("systemctl", "--user", "restart")), 2)
+        self.assertFalse(pq.load_health_state()["restart_credentialsd"])
+
+    def test_a_request_that_ends_without_a_stuck_one_restarts_nothing(self):
+        self.answers["ps -u"] = ""
+        pq.end_request()
+        self.assertEqual(self.commands_starting("systemctl", "--user", "restart"), [])
+
     def test_a_recycled_pid_is_never_ended(self):
         self.patched(still_helper=lambda pid: False)  # the helper exited and another process got its pid
         with mock.patch.object(pq.os, "kill") as sigkill:
@@ -1418,9 +1473,9 @@ class HealthRepairs(SelfHealingBase):
                          [["systemctl", "--user", "restart", "xdg-desktop-portal"]])
         self.assertEqual(self.notices, [])
 
-    def test_a_portal_that_stays_broken_is_restarted_once_per_cooldown_but_reported_every_run(self):
+    def test_a_portal_that_stays_broken_is_restarted_once_per_cooldown_and_told_once(self):
         self.patched(portal_credential_ready=lambda: False)
-        state = {}
+        state = {"pending": True}
         with mock.patch.object(pq.time, "sleep"), \
                 mock.patch.object(pq.time, "monotonic", side_effect=iter(range(0, 1000, 21))):
             pq.health_portal(state, 1000)
@@ -1531,7 +1586,7 @@ class HealthRepairs(SelfHealingBase):
         self.patched(real_adapters=lambda: [], bt_adapters=lambda: [], scanners_result=lambda: None,
                      unit_age=lambda unit: 500)
         self.answers["systemctl --user is-active ha-ble-vhci"] = "active"
-        state = {}
+        state = {"pending": True}
         with mock.patch.object(pq.time, "sleep"):
             for now in (1000, 1045, 1090):  # the first run restarts the bridge and gives it time
                 pq.health_bluetooth(state, now)
@@ -1546,7 +1601,7 @@ class HealthRepairs(SelfHealingBase):
         self.patched(session_ready=lambda: False, health_stuck_requests=lambda s, n: s.setdefault("a", 1),
                      health_bluetooth=lambda s, n: saves.append(dict(pq.load_health_state())))
         pq.health(1000)
-        self.assertEqual(saves, [{"a": 1}])  # the first check's result was on disk before the second ran
+        self.assertEqual(saves, [{"a": 1, "pending": True}])  # the first check's result was on disk before the second ran
 
     def test_one_crashing_check_does_not_stop_the_others(self):
         ran = []
@@ -1582,7 +1637,7 @@ class HealthRepairs(SelfHealingBase):
                      health_credentialsd=lambda s, n: ran.append("credentialsd"),
                      health_stuck_requests=lambda s, n: ran.append("stuck"))
         pq.health(1000)
-        self.assertEqual(ran, ["stuck", "bluetooth", "portal", "credentialsd"])
+        self.assertEqual(ran, ["stuck", "portal", "credentialsd", "bluetooth"])  # the one that can wait on the network last
 
     def test_a_bridge_too_old_for_scanners_is_not_blamed_on_home_assistant(self):
         self.patched(scanners_result=lambda: subprocess.CompletedProcess([], 2, "", "unrecognized arguments"),
@@ -1603,9 +1658,7 @@ class HealthRepairs(SelfHealingBase):
         self.patched(scanners_result=lambda: subprocess.CompletedProcess([], 4, "", ""),
                      scanner_log_says_none=lambda now: False)
         with mock.patch.dict(os.environ, {"PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT": "4x"}):
-            state = {}
-            pq.health_proxy(state, 1000)
-            pq.health_proxy(state, 1045)
+            pq.health_proxy({"pending": True}, 1000)
         self.assertEqual(len(self.notices), 1)
 
     def test_a_healthy_system_asks_each_thing_once(self):
@@ -1675,7 +1728,7 @@ class ScannerJournal(SelfHealingBase):
 
 
 class HealPrefs(unittest.TestCase):
-    """Firefox user.js drift: re-applied by `heal-prefs`, announced in the journal and on the desktop."""
+    """Firefox user.js drift: re-applied by `heal-prefs` and announced in the journal (never on the desktop)."""
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -1697,7 +1750,7 @@ class HealPrefs(unittest.TestCase):
         pq.cmd_heal_prefs(None)
         self.assertTrue(pq.usb_token_off_ok())
         self.assertIn('user_pref("mine", 1);', self.userjs.read_text())
-        self.assertEqual(self.notices, ["Firefox passkey settings were re-applied"])
+        self.assertEqual(self.notices, [])  # nobody is using a passkey right now: journal only
         self.assertTrue(any("drifted" in line for line in self.said))
 
     def test_prefs_in_place_are_not_touched_and_nobody_is_told(self):
@@ -1717,8 +1770,600 @@ class HealthCommandLine(unittest.TestCase):
     def test_help_lists_the_health_commands(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, timeout=60,
                                 env={**os.environ, "HOME": HOME})
-        self.assertIn("health", result.stdout)
-        self.assertIn("heal-prefs", result.stdout)
+        for command in ("watch", "health", "heal-prefs"):
+            self.assertIn(command, result.stdout)
+        self.assertNotIn("45 s", result.stdout)
+
+
+class RequestOnlyChecks(SelfHealingBase):
+    """Nothing runs while nobody uses a passkey: no timer, no Home Assistant query, no notification."""
+
+    def test_the_watcher_unit_is_a_service_without_any_timer(self):
+        files = pq.watch_unit_files()
+        self.assertEqual([path.name for path in files], ["passkey-qr-watch.service"])
+        text = next(iter(files.values()))
+        self.assertIn(f'ExecStart="{pq.HEALTH_BIN}" watch\n', text)
+        self.assertIn("Restart=always\n", text)
+        self.assertIn("StartLimitIntervalSec=0\n", text)
+        for forbidden in ("[Timer]", "OnUnitActiveSec", "OnCalendar", "OnBootSec"):
+            self.assertNotIn(forbidden, text)
+
+    def test_health_without_a_pending_request_does_nothing_at_all(self):
+        called = []
+        self.patched(pending_helpers=lambda: [], health=lambda now=None: called.append("health") or 0,
+                     scanners_result=lambda: called.append("query"))
+        pq.cmd_health(None)
+        self.assertEqual((called, self.notices, self.rec.commands), ([], [], []))
+        self.assertIn("no passkey request is pending", self.rec.text)
+
+    def test_health_with_a_pending_request_does_one_pass_and_settles_it(self):
+        passes = []
+        self.patched(pending_helpers=lambda: [(1, 5)], health=lambda now=None: passes.append(1) or 0)
+        pq.save_health_state({"pending": True, "issues": {"k": {"open": True, "fails": 2}}})
+        with self.assertRaises(SystemExit) as ended:
+            pq.cmd_health(None)
+        self.assertEqual((passes, ended.exception.code), ([1], 0))
+        self.assertFalse(pq.load_health_state()["pending"])
+
+    def test_a_pass_without_a_pending_request_never_asks_home_assistant(self):
+        self.loaded("ha-ble-vhci")
+        asked = []
+        self.patched(real_adapters=lambda: [], bt_adapters=lambda: ["hci0"], unit_age=lambda unit: 500,
+                     scanners_result=lambda: asked.append(1))
+        self.answers["systemctl --user is-active ha-ble-vhci"] = "active"
+        self.answers["bluetoothctl show"] = "Powered: yes"
+        pq.health_bluetooth({}, 1000)
+        self.assertEqual(asked, [])
+        pq.health_bluetooth({"pending": True}, 1000)
+        self.assertEqual(asked, [1])
+
+    def test_a_failure_without_a_pending_request_only_reaches_the_journal(self):
+        pq.report({}, "k", False, 1000, up=("up", "b"), down=("down", "b"))
+        self.assertEqual(self.notices, [])
+        self.assertIn("k: FAILING (1x): down", self.rec.text)
+
+
+class ServeRequest(SelfHealingBase):
+    def setUp(self):
+        super().setUp()
+        self.helpers, self.passes, self.sleeps = [], [], []
+        self.patched(pending_helpers=lambda: self.helpers, health=lambda now=None: self.passes.append(1) or 0)
+
+    def test_a_request_without_a_helper_is_checked_exactly_once(self):
+        pq.serve_request(sleep=self.sleeps.append)
+        self.assertEqual((len(self.passes), self.sleeps), (1, []))
+
+    def test_a_waiting_helper_keeps_the_request_pending_and_is_rechecked_every_interval(self):
+        self.helpers = [(10, 5)]
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            if len(self.sleeps) == 3:
+                self.helpers = []  # the request ended during the third wait
+
+        pq.serve_request(sleep=sleep)
+        self.assertEqual(self.sleeps, [pq.REQUEST_CHECK_SECONDS] * 3)
+        self.assertEqual(len(self.passes), 3)  # now, after wait 1, after wait 2: not after the one it ended in
+
+    def test_a_request_that_ended_while_waiting_is_not_checked_or_announced_again(self):
+        self.helpers = [(10, 5)]
+        self.sleeps_seen = []
+
+        def sleep(seconds):
+            self.sleeps_seen.append(seconds)
+            self.helpers = []
+
+        pq.serve_request(sleep=sleep)
+        self.assertEqual((len(self.passes), self.notices), (1, []))
+
+    def test_the_marker_exists_exactly_while_the_request_is_served(self):
+        seen = []
+        self.patched(health=lambda now=None: seen.append(pq.REQUEST_MARKER.exists()) or 0)
+        self.assertFalse(pq.REQUEST_MARKER.exists())
+        pq.serve_request(sleep=self.sleeps.append)
+        self.assertEqual(seen, [True])
+        self.assertFalse(pq.REQUEST_MARKER.exists())
+
+    def test_a_crashing_pass_still_clears_the_marker_and_the_pending_flag(self):
+        def boom(now=None):
+            raise RuntimeError("boom")
+
+        self.patched(health=boom)
+        pq.save_health_state({"pending": True})
+        with self.assertRaises(RuntimeError):
+            pq.serve_request(sleep=self.sleeps.append)
+        self.assertFalse(pq.REQUEST_MARKER.exists())
+        self.assertFalse(pq.load_health_state()["pending"])
+
+    def test_the_end_of_a_request_settles_what_was_told_but_keeps_the_rate_limit(self):
+        pq.save_health_state({"pending": True, "ha_down": {"since": 1, "last": 2},
+                              "issues": {"k": {"open": True, "fails": 3, "told": 5}}})
+        pq.serve_request(sleep=self.sleeps.append)
+        state = pq.load_health_state()
+        self.assertEqual(state["issues"]["k"], {"open": False, "fails": 0, "told": 5})
+        self.assertNotIn("ha_down", state)
+        self.assertFalse(state["pending"])
+
+    def test_status_shows_whether_a_request_is_pending(self):
+        pq.show_request_status()
+        self.assertIn("none pending", self.rec.text)
+        pq.mark_request(True)
+        pq.show_request_status()
+        self.assertIn("pending since", self.rec.said[-1])
+
+    def test_a_dry_run_writes_no_marker(self):
+        self.set_flags(dry_run=True)
+        pq.mark_request(True)
+        self.assertFalse(pq.REQUEST_MARKER.exists())
+
+    def test_passes_do_not_overlap(self):
+        with pq.pass_lock(wait=True) as first, pq.pass_lock(wait=False) as second:
+            self.assertEqual((first, second), (True, False))
+        with pq.pass_lock(wait=False) as again:
+            self.assertTrue(again)  # released with the first holder
+
+    def test_an_unusable_runtime_directory_does_not_stop_the_pass(self):
+        self.patched(PASS_LOCK=Path("/proc/nonexistent/pass.lock"))
+        with pq.pass_lock(wait=True) as held:
+            self.assertTrue(held)
+
+    def test_a_manual_pass_leaves_a_request_the_watcher_is_serving_alone(self):
+        self.helpers = [(1, 5)]
+        pq.mark_request(True)
+        pq.cmd_health(None)
+        self.assertEqual(self.passes, [])
+        self.assertIn("serving this request already", self.rec.text)
+
+    def test_a_manual_pass_does_not_start_while_another_pass_runs(self):
+        self.helpers = [(1, 5)]
+        with pq.pass_lock(wait=True):
+            pq.cmd_health(None)
+        self.assertEqual(self.passes, [])
+        self.assertIn("another health pass is running", self.rec.text)
+
+
+class Watcher(SelfHealingBase):
+    PORTAL = "org.freedesktop.portal.Desktop"
+
+    def message(self, member="CreateCredential", at=1000.0, **over):
+        data = {"type": "method_call", "destination": self.PORTAL, "interface": pq.REQUEST_INTERFACE,
+                "member": member, "timestamp-realtime": int(at * 1e6)}
+        data.update(over)
+        return json.dumps(data) + "\n"
+
+    def register(self, app="org.mozilla.firefox", at=1000.0):
+        return self.message("Register", at, interface=pq.REGISTRY_INTERFACE,
+                            payload={"type": "sa{sv}", "data": [app, {}]})
+
+    def run_watch(self, lines, helpers=(), waiting_at_start=False):
+        """``waiting_at_start``: a helper is alive at the startup scan; ``helpers``: what later checks (after a
+        portal call) see."""
+        served, order = [], []
+        monitor = mock.Mock(stdout=iter(lines))
+        monitor.wait.return_value = 1
+        clock = iter([1010.0, 1100.0, 1200.0, 1300.0])
+
+        def helpers_now():
+            order.append("scan")
+            if order.count("scan") == 1:  # the startup scan
+                return [(1, 1)] if waiting_at_start else []
+            return list(helpers)
+
+        self.patched(serve_request=lambda: served.append(1), pending_helpers=helpers_now)
+        with mock.patch.object(pq.subprocess, "Popen", side_effect=lambda *a, **k: order.append("monitor") or monitor) as popen, \
+                mock.patch.object(pq.time, "time", side_effect=lambda: next(clock)), \
+                mock.patch.object(pq.time, "sleep") as sleep, \
+                self.assertRaises(SystemExit) as ended:
+            pq.cmd_watch(None)
+        self.order = order
+        return served, popen, sleep, ended.exception
+
+    def test_only_calls_to_the_portal_that_start_a_passkey_are_requests(self):
+        self.assertEqual(pq.request_call_time(self.message()), 1000.0)
+        self.assertEqual(pq.request_call_time(self.message("GetCredential", 5.5)), 5.5)
+        self.assertEqual(pq.request_call_time(self.register()), 1000.0)  # the helper registers first
+        for other in (self.message("GetClientCapabilities"),
+                      self.message(interface="org.freedesktop.DBus.Properties"),
+                      self.message(destination="org.example.Other"),  # same interface, some other service
+                      self.message(**{"type": "signal"}), self.register("org.gnome.Other"),
+                      self.message("Register", interface=pq.REGISTRY_INTERFACE),  # no payload
+                      "not json\n", "[1]\n", "Monitoring bus message stream.\n"):
+            self.assertIsNone(pq.request_call_time(other), other)
+
+    def test_a_message_without_a_timestamp_counts_as_now(self):
+        line = json.dumps({"type": "method_call", "destination": self.PORTAL, "interface": pq.REQUEST_INTERFACE,
+                           "member": "GetCredential"})
+        with mock.patch.object(pq.time, "time", return_value=42.0):
+            self.assertEqual(pq.request_call_time(line), 42.0)
+
+    def test_the_monitor_only_listens_for_the_two_portal_calls_that_start_a_request(self):
+        _, popen, _, _ = self.run_watch([])
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:4], ["busctl", "--user", "monitor", "--json=short"])
+        rules = [argv[i + 1] for i, word in enumerate(argv) if word == "--match"]
+        self.assertEqual(rules, list(pq.REQUEST_MATCHES))
+        self.assertTrue(all("type='method_call'" in rule for rule in rules))
+        self.assertIn("interface='org.freedesktop.portal.experimental.Credential'", rules[0])
+        self.assertIn("interface='org.freedesktop.host.portal.Registry',member='Register',arg0='org.mozilla.firefox'",
+                      rules[1])
+
+    def test_the_monitor_is_attached_before_the_startup_scan_so_no_request_can_slip_between(self):
+        self.run_watch([])
+        self.assertLess(self.order.index("monitor"), self.order.index("scan"))
+
+    def test_an_idle_bus_means_no_work_and_no_waiting(self):
+        served, _, sleep, _ = self.run_watch([])
+        self.assertEqual((served, self.notices, self.rec.commands), ([], [], []))
+        sleep.assert_not_called()
+
+    def test_each_request_is_served_after_a_helper_is_seen_and_noise_is_ignored(self):
+        served, _, sleep, _ = self.run_watch(
+            [self.message(at=1000), "Monitoring bus message stream.\n", self.message("GetClientCapabilities", at=1050),
+             self.message(at=1100.5)], helpers=[(7, 3)])
+        self.assertEqual(len(served), 2)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [pq.REQUEST_SETTLE_SECONDS] * 2)
+
+    def test_a_hung_portal_is_noticed_from_the_helpers_registration_alone(self):
+        served, _, _, _ = self.run_watch([self.register()], helpers=[(7, 3)])
+        self.assertEqual(len(served), 1)
+
+    def test_portal_calls_without_a_firefox_helper_behind_them_are_not_requests(self):
+        flood = [self.message(at=1000 + i / 100) for i in range(50)]  # something spamming the portal
+        served, _, sleep, _ = self.run_watch(flood, helpers=[])
+        self.assertEqual(served, [])
+        self.assertEqual(sleep.call_count, 1)  # the first call settled the question for the whole backlog
+        self.assertIn("without a Firefox helper behind it", self.rec.text)
+
+    def test_calls_made_while_a_request_was_served_belong_to_it(self):
+        served, _, _, _ = self.run_watch([self.message(at=1000), self.message("GetCredential", at=1005),
+                                          self.message(at=1100)], helpers=[(7, 3)])
+        self.assertEqual(len(served), 2)  # the second line (1005) is older than the end of the first serving (1010)
+
+    def test_a_request_already_waiting_when_the_watcher_starts_is_served(self):
+        served, _, _, _ = self.run_watch([], waiting_at_start=True)
+        self.assertEqual(len(served), 1)
+
+    def test_a_marker_left_by_a_killed_run_is_cleared_at_start(self):
+        pq.mark_request(True)
+        self.run_watch([])
+        self.assertFalse(pq.REQUEST_MARKER.exists())
+
+    def test_a_dead_monitor_ends_the_watcher_so_systemd_restarts_it(self):
+        _, _, _, ended = self.run_watch([])
+        self.assertIn("busctl monitor ended (exit 1)", str(ended.code))
+
+
+class NotificationRules(SelfHealingBase):
+    """report(): once per failure, rate limited across requests, 'recovered' only for a request that was told."""
+
+    def failing(self, now, pending=True):
+        state = pq.load_health_state()
+        state["pending"] = pending
+        pq.report(state, "k", False, now, up=("back", "ok"), down=("down", "bad"))
+        pq.save_health_state(state)
+
+    def recover(self, now):
+        state = pq.load_health_state()
+        state["pending"] = True
+        pq.report(state, "k", True, now, up=("back", "ok"))
+        pq.save_health_state(state)
+
+    def titles(self):
+        return [title for title, _ in self.notices]
+
+    def test_a_failure_is_told_once_however_often_it_is_rechecked(self):
+        for tick in range(20):
+            self.failing(1000 + 20 * tick)
+        self.assertEqual(self.titles(), ["down"])
+
+    def test_recovery_is_told_once_to_the_request_that_heard_the_failure(self):
+        self.failing(1000)
+        self.recover(1020)
+        self.recover(1040)
+        self.assertEqual(self.titles(), ["down", "back"])
+
+    def test_a_failure_that_ends_with_its_request_is_not_announced_as_recovered_by_the_next_one(self):
+        self.failing(1000)
+        pq.end_request()
+        self.recover(1500)
+        self.assertEqual(self.titles(), ["down"])
+
+    def test_a_retrying_user_is_not_told_twice_within_the_rate_limit_but_hears_that_it_is_over(self):
+        self.failing(1000)
+        pq.end_request()
+        self.failing(1060)  # a second request while the same outage lasts
+        self.assertEqual(self.titles(), ["down"])
+        self.recover(1080)
+        self.assertEqual(self.titles(), ["down", "back"])
+
+    def test_a_request_after_the_rate_limit_is_told_again(self):
+        self.failing(1000)
+        pq.end_request()
+        self.failing(1000 + pq.NOTIFY_MIN_SECONDS + 1)
+        self.assertEqual(self.titles(), ["down", "down"])
+
+    def test_a_clock_set_back_does_not_silence_the_user_forever(self):
+        self.failing(5000)
+        pq.end_request()
+        self.failing(1000)
+        self.assertEqual(self.titles(), ["down", "down"])
+
+    def test_a_failure_that_never_recovers_is_never_called_recovered(self):
+        self.failing(1000)
+        self.failing(1020)
+        self.assertEqual(self.titles(), ["down"])
+
+    def test_a_blip_is_never_announced_when_nothing_was_told(self):
+        self.recover(1000)
+        self.assertEqual(self.notices, [])
+
+
+class HomeAssistantReasons(unittest.TestCase):
+    def test_what_the_bridge_said_becomes_words(self):
+        for said, expected in (
+            ("cannot reach Home Assistant at http://odroidn2:8123: Cannot connect to host odroidn2:8123 ssl:default "
+             "[Connect call failed ('100.116.57.66', 8123)]", "nothing answers on its port"),
+            ("cannot reach Home Assistant at http://x:8123: [Errno -2] Name or service not known", "does not resolve"),
+            ("Temporary failure in name resolution", "does not resolve"),
+            ("[Errno 101] Network is unreachable", "network is unreachable"),
+            ("Home Assistant did not answer the scanner subscription", "no answer in time"),
+            ("Home Assistant dropped the connection during the handshake", "dropped the connection"),
+            ("Timeout on reading data from socket", "no answer in time"),
+        ):
+            self.assertIn(expected, pq.ha_reason(said), said)
+
+    def test_an_unknown_complaint_is_passed_through_trimmed_and_an_empty_one_is_named(self):
+        self.assertEqual(pq.ha_reason("weird " * 40), ("weird " * 40)[:120])
+        self.assertEqual(pq.ha_reason(""), "no answer")
+
+    def test_the_bridges_own_prefix_is_not_repeated_in_the_message(self):
+        self.assertEqual(pq.ha_reason("cannot reach Home Assistant at http://x:8123: something odd"), "something odd")
+        self.assertIn("dropped the connection",
+                      pq.ha_reason("cannot reach Home Assistant at http://127.0.0.1:18123: Server disconnected"))
+
+
+class HomeAssistantDown(SelfHealingBase):
+    """What the user is told, and what is done, when the bridge cannot reach Home Assistant during a request."""
+
+    URL = "http://odroidn2:8123"
+    REFUSED = ("cannot reach Home Assistant at http://odroidn2:8123: Cannot connect to host odroidn2:8123 ssl:default "
+               "[Connect call failed ('100.116.57.66', 8123)]")
+
+    def setUp(self):
+        super().setUp()
+        self.patched(scanner_log_says_none=lambda now: False, ha_url_configured=lambda: self.URL)
+        self.queries = []
+
+    def answer(self, *codes, reason=REFUSED):
+        replies = iter(codes)
+        self.patched(scanner_query=lambda: self.queries.append(1) or (next(replies), reason))
+
+    def test_unreachable_is_told_with_the_reason_and_what_happens_next(self):
+        self.answer(5, 5)
+        state = {"pending": True}
+        pq.health_proxy(state, 1000)
+        self.assertEqual(self.notices, [("Home Assistant is unreachable", True)])
+        body = self.bodies[0]
+        self.assertIn(self.URL, body)
+        self.assertIn("nothing answers on its port", body)
+        self.assertIn("you are told when it is back", body)
+        self.assertNotIn("exit 5", body)
+        self.assertNotIn("exit 1", body)
+
+    def test_a_failed_query_is_repeated_once_before_the_user_is_told(self):
+        self.answer(5, 0)
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual((self.notices, len(self.queries)), ([], 2))
+
+    def test_a_query_that_is_fine_is_asked_once(self):
+        self.answer(0)
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual(len(self.queries), 1)
+
+    def test_a_missing_proxy_is_not_repeated_and_says_the_esp32_returns_after_a_restart(self):
+        self.answer(4)
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual((self.notices, len(self.queries)), ([("Bluetooth proxy (ESP32) is offline", True)], 1))
+        self.assertIn("has just restarted", self.bodies[0])
+
+    def test_a_refused_token_is_not_called_unreachable(self):
+        self.answer(1, reason="authentication failed: {'type': 'auth_invalid'}")
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual(self.notices, [("Home Assistant refuses the passkey bridge", True)])
+        self.assertIn("auth_invalid", self.bodies[0])
+        self.assertIn("token", self.bodies[0])
+
+    def test_home_assistant_answering_again_ends_the_outage_tracking(self):
+        state = {"pending": True, "ha_down": {"since": 1, "last": 2}}
+        self.answer(4)
+        pq.health_proxy(state, 1000)
+        self.assertNotIn("ha_down", state)
+
+    def test_a_bridge_crash_is_never_blamed_on_home_assistant(self):
+        self.answer(70)
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual(self.notices, [])
+
+    def test_a_home_assistant_that_accepts_the_connection_but_never_answers_is_unreachable(self):
+        bridge, cfg = self.root / "bridge", self.root / "cfg"
+        cfg.mkdir()
+        bridge.write_text("#!/bin/sh\n")
+        (cfg / "token").write_text("not-a-real-token\n")
+        self.patched(BRIDGE_BIN=bridge, BRIDGE_CFG=cfg)
+        with mock.patch.object(pq.subprocess, "run", side_effect=subprocess.TimeoutExpired("bridge", 15)) as run:
+            pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual(run.call_count, 1)  # it already waited its full timeout: not asked a second time
+        self.assertEqual(self.notices, [("Home Assistant is unreachable", True)])
+        self.assertIn("no answer in time", self.bodies[0])
+
+    def test_an_unconfigured_bridge_is_still_not_an_outage(self):
+        self.patched(BRIDGE_BIN=self.root / "missing")
+        pq.health_proxy({"pending": True}, 1000)
+        self.assertEqual(self.notices, [])
+
+    def test_the_outage_is_timed_across_passes_and_restarts_after_a_gap(self):
+        state = {}
+        self.assertEqual(pq.note_ha_down(state, 1000), 0)
+        self.assertEqual(pq.note_ha_down(state, 1020), 20)
+        self.assertEqual(pq.note_ha_down(state, 1100), 100)
+        self.assertEqual(pq.note_ha_down(state, 1100 + pq.HA_DOWN_GAP_SECONDS + 1), 0)  # a new outage
+
+
+class HomeAssistantRepair(SelfHealingBase):
+    """Looking at, and when it is really broken restarting, Home Assistant's container over the user's own SSH."""
+
+    NOW = calendar.timegm((2026, 10, 23, 12, 0, 0))
+    RUNNING = "running|healthy|2026-10-20T10:00:00.5Z|2026-10-20T09:59:00Z"
+    UNHEALTHY = "running|unhealthy|2026-10-20T10:00:00.5Z|2026-10-20T09:59:00Z"
+    STOPPED = "exited|none|2026-10-22T10:00:00Z|2026-10-23T08:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        pq.HA_REPAIR_CONFIG.parent.mkdir(parents=True)
+        pq.HA_REPAIR_CONFIG.write_text("HA_CONTAINER=homeassistant-homeassistant-1\n")
+        self.patched(ha_url_configured=lambda: "http://odroidn2:8123", ssh_docker=self.fake_docker)
+        self.docker, self.inspect, self.action_code = [], self.RUNNING, 0
+
+    def fake_docker(self, host, *words, timeout=25):
+        self.docker.append((host, *words))
+        if words[0] == "inspect":
+            return subprocess.CompletedProcess([], 0 if self.inspect else 255, self.inspect, "")
+        return subprocess.CompletedProcess([], self.action_code, "", "Error: no such container")
+
+    def actions(self):
+        return [call for call in self.docker if call[1] != "inspect"]
+
+    def plan(self, down_for=0.0, **fields):
+        info = {"status": "running", "health": "healthy", "started": self.NOW - 3600, "finished": 0.0, **fields}
+        return pq.ha_container_plan(info, self.NOW, down_for)[0]
+
+    def test_the_decision_table(self):
+        self.assertEqual(self.plan(status="exited", finished=self.NOW - 3600), "start")
+        self.assertEqual(self.plan(status="exited", finished=self.NOW - 5), "wait")  # Docker restarts it itself
+        self.assertEqual(self.plan(status="dead"), "start")
+        self.assertEqual(self.plan(status="created"), "start")
+        self.assertEqual(self.plan(status="paused"), "unpause")
+        self.assertEqual(self.plan(status="restarting"), "wait")
+        self.assertEqual(self.plan(health="healthy", down_for=10 * 3600), "wait")  # a healthy container is never restarted
+        self.assertEqual(self.plan(health="none", down_for=10 * 3600), "wait")
+        self.assertEqual(self.plan(health="unhealthy", down_for=pq.HA_HUNG_SECONDS - 1), "wait")
+        self.assertEqual(self.plan(health="unhealthy", down_for=pq.HA_HUNG_SECONDS), "restart")
+        self.assertEqual(self.plan(health="unhealthy", down_for=3600, started=self.NOW - 100), "wait")  # still booting
+
+    def test_a_stopped_container_is_started_and_the_user_is_told_so(self):
+        self.inspect = self.STOPPED
+        said = pq.ha_repair({}, self.NOW, 0)
+        self.assertEqual(self.actions(), [("odroidn2", "start", "homeassistant-homeassistant-1")])
+        self.assertIn("was stopped: it was started", said)
+
+    def test_a_core_restart_with_the_container_up_is_left_alone(self):
+        said = pq.ha_repair({}, self.NOW, 150)
+        self.assertEqual(self.actions(), [])
+        self.assertEqual(len(self.docker), 1)  # the inspect
+        self.assertIn("itself is restarting", said)
+
+    def test_a_deliberate_restart_every_few_minutes_is_never_fought(self):
+        self.inspect = self.UNHEALTHY
+        state = {}
+        for restart in range(3):  # three core restarts, each 3 min of 'unreachable', 4 min apart
+            base = self.NOW + restart * 600
+            for second in range(0, 181, 20):
+                pq.ha_repair(state, base + second, pq.note_ha_down(state, base + second))
+        self.assertEqual(self.actions(), [])
+
+    def test_a_container_hung_for_minutes_is_restarted_once(self):
+        self.inspect = self.UNHEALTHY
+        state = {}
+        for second in range(0, 600, 20):
+            pq.ha_repair(state, self.NOW + second, pq.note_ha_down(state, self.NOW + second))
+        self.assertEqual(self.actions(), [("odroidn2", "restart", "homeassistant-homeassistant-1")])
+
+    def test_it_is_looked_at_over_ssh_at_most_once_a_minute(self):
+        state = {}
+        pq.ha_repair(state, self.NOW, 0)
+        self.assertEqual(pq.ha_repair(state, self.NOW + 20, 20), "")
+        self.assertEqual(len(self.docker), 1)
+        pq.ha_repair(state, self.NOW + 61, 61)
+        self.assertEqual(len(self.docker), 2)
+
+    def test_a_repair_is_not_repeated_within_the_cooldown(self):
+        self.inspect = self.STOPPED
+        state = {}
+        pq.ha_repair(state, self.NOW, 0)
+        said = pq.ha_repair(state, self.NOW + 120, 120)  # still stopped two minutes later: Docker/ssh did not help
+        self.assertEqual(len(self.actions()), 1)
+        self.assertIn("was stopped", said)
+
+    def test_without_ssh_access_nothing_is_done_and_the_user_is_told_why(self):
+        self.inspect = ""
+        said = pq.ha_repair({}, self.NOW, 0)
+        self.assertEqual(self.actions(), [])
+        self.assertIn("over SSH", said)
+
+    def test_a_failed_repair_is_reported_not_claimed(self):
+        self.inspect, self.action_code = self.STOPPED, 1
+        said = pq.ha_repair({}, self.NOW, 0)
+        self.assertIn("did not work", said)
+        self.assertNotIn("it was started", said)
+
+    def test_without_a_configured_container_nothing_is_touched(self):
+        pq.HA_REPAIR_CONFIG.unlink()
+        self.assertEqual(pq.ha_repair({}, self.NOW, 9999), "")
+        self.assertEqual(self.docker, [])
+
+    def test_a_dry_run_looks_but_never_acts(self):
+        self.set_flags(dry_run=True)
+        self.inspect = self.STOPPED
+        pq.ha_repair({}, self.NOW, 0)
+        self.assertEqual(self.actions(), [])
+
+    def test_the_ssh_host_defaults_to_the_home_assistant_host_and_can_be_set(self):
+        self.assertEqual(pq.ha_repair_target(), ("odroidn2", "homeassistant-homeassistant-1"))
+        pq.HA_REPAIR_CONFIG.write_text("HA_CONTAINER=ha\nHA_SSH_HOST=me@box\n")
+        self.assertEqual(pq.ha_repair_target(), ("me@box", "ha"))
+
+    def test_values_that_could_smuggle_a_command_or_an_option_are_refused(self):
+        for bad in ("HA_CONTAINER=x;reboot", "HA_CONTAINER=$(id)", "HA_CONTAINER=a|b", "HA_CONTAINER=-rf"):
+            pq.HA_REPAIR_CONFIG.write_text(bad + "\n")
+            self.assertIsNone(pq.ha_repair_target(), bad)
+        pq.HA_REPAIR_CONFIG.write_text("HA_CONTAINER=ha\nHA_SSH_HOST=-oProxyCommand=evil\n")
+        self.assertIsNone(pq.ha_repair_target())
+
+    def test_a_missing_or_url_less_config_means_no_repair(self):
+        self.patched(ha_url_configured=lambda: None)
+        pq.HA_REPAIR_CONFIG.write_text("HA_CONTAINER=ha\n")
+        self.assertIsNone(pq.ha_repair_target())
+        pq.HA_REPAIR_CONFIG.unlink()
+        self.assertIsNone(pq.ha_repair_target())
+
+    def test_docker_runs_over_batchmode_ssh_with_every_word_quoted(self):
+        self.patched(ssh_docker=self.real_ssh_docker)
+        with mock.patch.object(pq.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            pq.ssh_docker("odroidn2", "inspect", "--format", "{{.State.Status}} x", "name")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "odroidn2"])
+        self.assertEqual(argv[6], "docker inspect --format '{{.State.Status}} x' name")
+
+    def test_ssh_that_cannot_run_is_none_not_a_crash(self):
+        self.patched(ssh_docker=self.real_ssh_docker)
+        with mock.patch.object(pq.subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 25)):
+            self.assertIsNone(pq.ssh_docker("h", "ps"))
+        with mock.patch.object(pq.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertIsNone(pq.ssh_docker("h", "ps"))
+
+    def test_docker_timestamps(self):
+        self.assertAlmostEqual(pq.docker_time("2026-10-23T01:03:34.99516253Z"),
+                               calendar.timegm((2026, 10, 23, 1, 3, 34)) + 0.99516253)
+        self.assertEqual(pq.docker_time("2026-10-23T01:03:34Z"), calendar.timegm((2026, 10, 23, 1, 3, 34)))
+        self.assertEqual(pq.docker_time("0001-01-01T00:00:00Z"), 0.0)
+        self.assertEqual(pq.docker_time(""), 0.0)
+
+    def test_the_notification_carries_what_was_found_and_done(self):
+        self.inspect = self.STOPPED
+        self.patched(scanner_log_says_none=lambda now: False, scanner_query=lambda: (5, "Connect call failed"))
+        pq.health_proxy({"pending": True}, self.NOW)
+        self.assertIn("Its container was stopped: it was started", self.bodies[0])
+        self.assertEqual(self.notices, [("Home Assistant is unreachable", True)])
 
 
 if __name__ == "__main__":
