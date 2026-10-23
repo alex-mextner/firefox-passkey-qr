@@ -112,7 +112,7 @@ Home Assistant tokens are never logged.
   the helper's earlier registration). Another Firefox instance registering its app id with the portal (a headless
   test browser, say) also reaches the watcher, which sees at once that the call is not the helper's, drops it
   and goes back to sleep: no process scan, no query, no journal line. The moment a passkey request starts it
-  checks the chain at once and every 20 s for as long as that
+  checks the chain at once and again 20 s after each pass ends (a slow Home Assistant makes a pass longer) for as long as that
   helper process lives: starts `ha-ble-vhci` if it is stopped and restarts it when it registered no adapter or
   says "no scanner" while Home Assistant sees one; powers on an unpowered adapter; restarts
   `xdg-desktop-portal` if it does not offer `org.freedesktop.portal.experimental.Credential`; starts
