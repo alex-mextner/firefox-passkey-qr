@@ -18,6 +18,7 @@ automatically, after a confirmation:
 | 3 | **Only if the PC has no Bluetooth and Home Assistant is reachable:** installs [ha-ble-vhci](https://github.com/alex-mextner/ha-ble-vhci) | the QR flow requires the PC to *hear the phone's BLE advertisement*; ha-ble-vhci gets those from your ESPHome Bluetooth proxy through Home Assistant and presents them to BlueZ as a local adapter |
 | 4 | builds [credentialsd](https://github.com/linux-credentials/credentialsd) + its patched `xdg-desktop-portal` into `/usr/local` | the credential manager that implements hybrid on Linux |
 | 5 | native-messaging link + a Firefox policy (`/etc/firefox/policies/policies.json`, `normal_installed`) that installs the Mozilla-signed `credentialsd-helper` extension on next start (you can still disable it) | intercepts `navigator.credentials` in Firefox and shows the phone/USB chooser |
+| 6 | **self-healing**, user space only: systemd drop-ins, a request watcher (no timer, no polling) and a Firefox-prefs path unit (below) | every link of the chain restarts and repairs itself; while you use a passkey an unreachable Home Assistant or an offline Bluetooth proxy is announced once on the desktop instead of a silently hanging QR window, and nothing is checked or shown while you do not |
 
 If the PC has a real Bluetooth adapter, step 3 does nothing. If it has neither
 Bluetooth nor Home Assistant, the installer tells you to get a USB BLE dongle.
@@ -89,6 +90,64 @@ Everything shown on screen during `install`, including all command output, is al
 last run) together with a diagnostic snapshot at the end or on failure.
 Home Assistant tokens are never logged.
 
+## Self-healing (step 6)
+
+`passkey-qr install` (step 6, a required row of `check`/`status`, no root) installs:
+
+* **Restart policy** - a drop-in `~/.config/systemd/user/<unit>.service.d/99-passkey-qr-selfheal.conf`
+  (named to sort last, so no other drop-in's `Restart=` wins)
+  (`Restart=always`, `StartLimitIntervalSec=0`, `RestartSec=2..5`) for `ha-ble-vhci`, `xdg-desktop-portal`,
+  `xyz.iinuwa.credentialsd.Credentials`, `xyz.iinuwa.credentialsd.UiControl` and `passwords-appd` (a unit that
+  is not installed is skipped). A killed or crashed service is back within seconds, however often it dies.
+  A `RestartPreventExitStatus=` from another drop-in still wins: `passwords-appd` keeps `=1` on purpose, because
+  its exit 1 now only means "the bus name is already owned" (another instance is alive) and restarting would
+  only fight it; unreadable data or a locked keyring exit 75 and are retried.
+* **Request watcher** - `passkey-qr-watch.service` runs `passkey-qr watch` from a copy of the installer in
+  `~/.local/libexec/passkey-qr/` (`install` refreshes it after you update the checkout; a stale copy does not fail
+  `check`). It is **blocked on the session bus** (`busctl --user monitor`, woken only by the Firefox helper's
+  `Registry.Register` and `CreateCredential`/`GetCredential` calls to the portal): no timer, no polling,
+  **nothing is checked, no Home Assistant query is made and no notification is shown while you are not using a
+  passkey**. A portal call only counts when a `credentialsd-firefox-helper` process is alive 5 s after it (so
+  other programs cannot trigger it, and a portal that hangs before the credential call is still noticed through
+  the helper's earlier registration). Another Firefox instance registering its app id with the portal (a headless
+  test browser, say) also reaches the watcher, which sees at once that the call is not the helper's, drops it
+  and goes back to sleep: no process scan, no query, no journal line. The moment a passkey request starts it
+  checks the chain at once and again 20 s after each pass ends (a slow Home Assistant makes a pass longer) for as long as that
+  helper process lives: starts `ha-ble-vhci` if it is stopped and restarts it when it registered no adapter or
+  says "no scanner" while Home Assistant sees one; powers on an unpowered adapter; restarts
+  `xdg-desktop-portal` if it does not offer `org.freedesktop.portal.experimental.Credential`; starts
+  `credentialsd`/`credentialsd-ui` on demand (restart when that fails); and **ends a stuck request**: a helper
+  process older than 10 minutes gets SIGKILL by pid and credentialsd + its UI are restarted (deferred while
+  another, younger request is still running, so it is never aborted). Restarts of the portal and of credentialsd
+  that did not help are retried at most every 5 minutes. While a request is pending the file
+  `$XDG_RUNTIME_DIR/passkey-qr/request-pending` exists; `passkey-qr status` shows it. The old 45 s
+  `passkey-qr-health.timer` is removed by `install`. `passkey-qr health` does one such pass by hand, and only
+  when a request is pending.
+* **Home Assistant / proxy signal** - only while a request is pending: when `ha-ble-vhci --scanners` exits 4 (no
+  Bluetooth proxy online: after a Home Assistant restart the ESP32 is back within a minute or two) or 5 (Home
+  Assistant unreachable, asked twice 3 s apart) you get **one** desktop notification (`notify-send`) that says
+  what is wrong in words (`nothing answers on its port (it is restarting or stopped)`, `its host name does not
+  resolve`, ...) and what was found on the server (below). The same failure is told at most every 3 minutes even
+  if you retry the request, and "back online" is shown only to a request that was told about the failure. Idle,
+  everything goes to the journal only: `journalctl --user -u passkey-qr-watch`. State:
+  `~/.local/state/passkey-qr/health.json`.
+* **Home Assistant container repair (opt-in)** - when Home Assistant is unreachable during a request and
+  `~/.config/passkey-qr/ha-repair` names its Docker container (`HA_CONTAINER=homeassistant-homeassistant-1`,
+  optionally `HA_SSH_HOST=<ssh host>`, default: the host of the Home Assistant URL), the watcher looks at it over
+  your existing passwordless SSH (`ssh -o BatchMode=yes`: it never asks and never trusts an unknown host key; at
+  most once a minute). A container that is **stopped** is `docker start`ed (`unpause`d when paused); one that has
+  been **unhealthy and unreachable for 4 minutes** is `docker restart`ed (at most every 30 minutes); a container
+  that is running and healthy, or booting (< 10 min), or that Docker has just stopped is never touched, so a
+  deliberate Home Assistant restart is never fought. No SSH access, no repair.
+* **Firefox prefs** - `passkey-qr-prefs.path` watches `~/.mozilla/firefox/profiles.ini` and `installs.ini`
+  (and `passkey-qr-prefs.service` also runs at login); `passkey-qr heal-prefs` re-applies only the managed
+  `user.js` block when a Firefox update or a new profile dropped it and logs the drift to the journal (no
+  notification: you are not using a passkey at that moment).
+
+Test seams: `PASSKEY_QR_STUCK_SECONDS` (age limit), `PASSKEY_QR_HEALTH_FAKE_SCANNERS_EXIT` and
+`PASSKEY_QR_HEALTH_FAKE_SCANNERS_REASON` (pretend the `--scanners` exit code, e.g. `5`, and its last stderr line, to
+see the notification path).
+
 ## Not supported
 
 * **Touch ID on the Apple Magic Keyboard.** The keyboard is only a sensor:
@@ -124,6 +183,18 @@ Report breakage as issues.
 * `passkey-qr status` shows what is missing; the log is `~/.local/state/passkey-qr/latest.log`.
 * Bridge: `journalctl --user -u ha-ble-vhci`; `bluetoothctl list`. A logout and login is needed only when the
   installer reports that your user was just added to `plugdev` (the udev rule itself uses the `uaccess` tag).
+* QR dialog hangs / "QR stopped working" with the bridge running: the ESP32
+  Bluetooth proxy is probably powered off or off Wi-Fi. The bridge stays up and
+  Home Assistant is fine, but the phone's advert never arrives. `passkey-qr status`
+  shows a live `[ ] a Bluetooth proxy is online in Home Assistant` line (not a
+  `check` failure: an offline proxy is transient); power the ESP32 back on.
+  `ha-ble-vhci --scanners` and `journalctl --user -u ha-ble-vhci` say the same.
+* "Touch your security key" doorhanger although you have no key: the extension's
+  content scripts have no `all_frames`, so WebAuthn calls from a frame (Google
+  sign-in uses one) hit Firefox's native USB-token path and wait forever. Step 5
+  writes a `passkey-qr managed` block into `user.js` of the Firefox profile(s)
+  (`security.webauth.webauthn_enable_usbtoken`, `..._softtoken`, `u2f` = false);
+  other `user.js` lines are kept. No root needed; restart Firefox once to apply.
 * The installer reloads user systemd and D-Bus itself, so no logout is needed after installing.
 * Extension: restart Firefox once. The installer's policy grants the extension access to all sites, and
   `passkey-qr status` checks that in the profile.
