@@ -965,6 +965,167 @@ class FailureKeepsNotes(unittest.TestCase):
         self.assertIn("still waiting for you: 3. Bluetooth: needs a token", result.stderr)
 
 
+class MozillaRepo(Base):
+    """The repo step must not write a second definition of packages.mozilla.org: apt refuses to read sources
+    that give one repository two different Signed-By values. All apt paths are redirected to a temp tree."""
+
+    LIST_LINE = "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main\n"
+    SOURCES = ("# Managed by ubuntu-tweaks (apt-sources)\nTypes: deb\nURIs: https://packages.mozilla.org/apt\n"
+               "Suites: mozilla\nComponents: main\nSigned-By: /etc/apt/keyrings/mozilla.asc\n")
+    PIN = "Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n"
+
+    def setUp(self):
+        super().setUp()
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.d = self.root / "sources.list.d"
+        self.prefs = self.root / "preferences.d"
+        self.d.mkdir()
+        self.prefs.mkdir()
+        self.patched(APT_SOURCES_LIST=self.root / "sources.list", APT_SOURCES_DIR=self.d, APT_PREFS_DIR=self.prefs,
+                     MOZ_LIST=self.d / "mozilla.list", MOZ_KEY=self.root / "packages.mozilla.org.asc",
+                     MOZ_PIN=self.prefs / "mozilla", CACHE_DIR=self.root / "cache",
+                     out=lambda cmd, timeout=20: "packages.mozilla.org")
+
+    def write(self, path, text):
+        path.write_text(text)
+        return path
+
+    def pin(self):
+        self.write(self.prefs / "other-name", "Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n")
+
+    def written(self):
+        return [Path(c[5]) for c in self.rec.commands if c[:3] == ["sudo", "install", "-D"]]
+
+    def updated(self):
+        return ["sudo", "apt-get", "update"] in self.rec.commands
+
+    def test_a_definition_in_sources_list_satisfies_the_repo(self):
+        self.write(self.root / "sources.list", "# c\n" + self.LIST_LINE.replace("deb [", "deb [arch=amd64 ").replace("main\n", "main # mozilla\n"))
+        self.pin()
+        self.assertTrue(pq.mozilla_repo_ok())
+        pq.install_mozilla_repo()
+        self.assertEqual(self.rec.commands, [])
+
+    def test_a_list_file_under_another_name_and_key_satisfies_the_repo(self):
+        self.write(self.d / "firefox-extra.list", "deb-src [signed-by=/k/other.gpg] https://packages.mozilla.org/apt/ mozilla main\n")
+        self.pin()
+        self.assertTrue(pq.mozilla_repo_ok())
+        pq.install_mozilla_repo()
+        self.assertEqual(self.rec.commands, [])
+
+    def test_a_deb822_file_satisfies_the_repo(self):
+        self.write(self.d / "mozilla.sources", self.SOURCES)
+        self.pin()
+        self.assertTrue(pq.mozilla_repo_ok())
+        pq.install_mozilla_repo()
+        self.assertEqual(self.rec.commands, [])
+
+    def test_deb822_multi_value_uris_and_suites_count(self):
+        self.write(self.d / "m.sources", "Types: deb\nURIs: https://example.org/x https://packages.mozilla.org/apt/\n"
+                   "Suites: stable mozilla\nComponents: main\n")
+        self.assertEqual([p.name for p, _ in pq.mozilla_definitions()], ["m.sources"])
+
+    def test_things_that_are_not_a_definition_do_not_count(self):
+        self.write(self.root / "sources.list", "# " + self.LIST_LINE)
+        self.write(self.d / "off.sources", self.SOURCES.replace("Types: deb\n", "Types: deb\nEnabled: no\n"))
+        self.write(self.d / "host.list", "deb https://packages.example.org/apt mozilla main\n")
+        self.write(self.d / "suite.list", "deb https://packages.mozilla.org/apt other main\n")
+        self.write(self.d / "notes.txt", self.LIST_LINE)
+        self.write(self.d / "stanza.sources", "Types: deb\nURIs: https://example.org\nSuites: mozilla\n\n"
+                   "Types: deb\nURIs: https://packages.mozilla.org/apt\nSuites: other\n")
+        self.assertEqual(pq.mozilla_definitions(), [])
+        self.pin()
+        self.assertFalse(pq.mozilla_repo_ok())
+
+    def test_a_pin_in_any_preferences_file_counts_and_a_commented_one_does_not(self):
+        self.write(self.d / "mozilla.sources", self.SOURCES)
+        self.write(self.prefs / "x", "# Pin: origin packages.mozilla.org\n")
+        self.assertFalse(pq.mozilla_repo_ok())
+        self.pin()
+        self.assertTrue(pq.mozilla_repo_ok())
+
+    def test_the_repo_is_not_ok_while_apt_does_not_know_it(self):
+        self.write(self.d / "mozilla.sources", self.SOURCES)
+        self.pin()
+        self.patched(out=lambda cmd, timeout=20: "")
+        self.assertFalse(pq.mozilla_repo_ok())
+
+    def test_nothing_defined_writes_key_list_and_pin_then_updates(self):
+        pq.install_mozilla_repo()
+        self.assertEqual(self.written(), [pq.MOZ_LIST, pq.MOZ_PIN])
+        self.assertTrue(any(c[:2] == ["sudo", "curl"] for c in self.rec.commands))
+        self.assertTrue(self.updated())
+
+    def test_a_definition_without_a_pin_writes_only_the_pin(self):
+        self.write(self.d / "mozilla.sources", self.SOURCES)
+        pq.install_mozilla_repo()
+        self.assertEqual(self.written(), [pq.MOZ_PIN])
+        self.assertFalse(any(c[:2] == ["sudo", "curl"] for c in self.rec.commands))
+
+    def conflict(self):
+        self.write(self.d / "mozilla.sources", self.SOURCES)
+        self.write(self.d / "mozilla.list", self.LIST_LINE)
+        self.pin()
+
+    def test_two_definitions_with_different_keys_are_reported_with_the_exact_fix_and_nothing_is_changed(self):
+        self.conflict()
+        self.assertFalse(pq.mozilla_repo_ok())
+        with self.assertRaises(pq.StepError) as raised:
+            pq.install_mozilla_repo()
+        message = str(raised.exception)
+        self.assertIn(str(self.d / "mozilla.sources"), message)
+        self.assertIn(str(self.d / "mozilla.list"), message)
+        self.assertIn(f"sudo rm {self.d / 'mozilla.list'}", message)
+        self.assertEqual(self.rec.commands, [])
+        self.assertTrue((self.d / "mozilla.list").exists() and (self.d / "mozilla.sources").exists())
+
+    def test_status_shows_the_conflict_under_the_row(self):
+        self.conflict()
+        action = pq.firefox_actions()[0]
+        pq.show_actions([action])
+        self.assertIn(f"sudo rm {self.d / 'mozilla.list'}", self.rec.text)
+
+    def test_check_names_the_conflict(self):
+        self.conflict()
+        self.patched(status_rows=lambda: [(pq.firefox_actions()[0].name, False, True)])
+        with self.assertRaises(SystemExit):
+            pq.cmd_check(None)
+        self.assertIn(f"sudo rm {self.d / 'mozilla.list'}", self.rec.text)
+
+    def test_two_definitions_with_the_same_key_are_not_a_conflict(self):
+        self.write(self.d / "a.list", self.LIST_LINE)
+        self.write(self.d / "b.list", self.LIST_LINE)
+        self.assertIsNone(pq.mozilla_conflict())
+
+    def test_a_definition_without_signed_by_next_to_one_with_it_is_a_conflict(self):
+        self.write(self.d / "a.list", "deb https://packages.mozilla.org/apt mozilla main\n")
+        self.write(self.d / "b.list", self.LIST_LINE)
+        self.assertIn("sudo rm", pq.mozilla_conflict() or "")
+
+    def test_three_definitions_name_every_file_that_has_to_go(self):
+        self.write(self.d / "mozilla.sources", self.SOURCES)
+        self.write(self.d / "other.sources", self.SOURCES.replace("mozilla.asc", "other.asc"))
+        self.write(self.d / "mozilla.list", self.LIST_LINE)
+        message = pq.mozilla_conflict() or ""
+        self.assertIn(f"sudo rm {self.d / 'mozilla.list'}", message)
+        self.assertIn(f"sudo rm {self.d / 'other.sources'}", message)
+        self.assertNotIn(f"sudo rm {self.d / 'mozilla.sources'}", message)
+
+    def test_a_failing_update_names_the_conflict_cause(self):
+        def failing(cmd, *, sudo=False, **_):
+            self.rec.run(cmd, sudo=sudo)
+            if cmd[:2] == ["apt-get", "update"]:
+                self.write(self.d / "mozilla.sources", self.SOURCES)  # the conflict appears alongside the new list
+                raise subprocess.CalledProcessError(100, cmd, output="E: Conflicting values set for option Signed-By")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        self.patched(run=failing, sudo_write=lambda path, text: self.write(path, text))
+        with self.assertRaises(pq.StepError) as raised:
+            pq.install_mozilla_repo()
+        self.assertIn("Conflicting values set for option Signed-By", str(raised.exception))
+        self.assertIn("sudo rm", str(raised.exception))
+
+
 class Install(Base):
     def run_install(self):
         self.patched(STEPS=[], log_snapshot=lambda: None, open_test_page=lambda: None)
