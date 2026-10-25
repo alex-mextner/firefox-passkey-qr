@@ -14,7 +14,7 @@ automatically, after a confirmation:
 | Step | What | Why |
 |------|------|-----|
 | 1 | apt build/runtime packages | credentialsd and the portal are built from source |
-| 2 | Firefox from `packages.mozilla.org` (+ apt pin), copies your snap profile, optionally removes the snap | the Firefox snap sandbox blocks the native-messaging host the extension needs |
+| 2 | Firefox from `packages.mozilla.org` (+ apt pin; an existing definition of that repo in any apt sources file, e.g. one written by another tool, is reused, and two definitions with different `Signed-By` keys are reported with the `sudo rm` that fixes them, never deleted), copies your snap profile, optionally removes the snap | the Firefox snap sandbox blocks the native-messaging host the extension needs |
 | 3 | **Only if the PC has no Bluetooth and Home Assistant is reachable:** installs [ha-ble-vhci](https://github.com/alex-mextner/ha-ble-vhci) | the QR flow requires the PC to *hear the phone's BLE advertisement*; ha-ble-vhci gets those from your ESPHome Bluetooth proxy through Home Assistant and presents them to BlueZ as a local adapter |
 | 4 | builds [credentialsd](https://github.com/linux-credentials/credentialsd) + its patched `xdg-desktop-portal` into `/usr/local` | the credential manager that implements hybrid on Linux |
 | 5 | native-messaging link + a Firefox policy (`/etc/firefox/policies/policies.json`, `normal_installed`) that installs the Mozilla-signed `credentialsd-helper` extension on next start (you can still disable it) | intercepts `navigator.credentials` in Firefox and shows the phone/USB chooser |

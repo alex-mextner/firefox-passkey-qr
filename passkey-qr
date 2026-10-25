@@ -65,6 +65,10 @@ MOZ_PROFILE = HOME / ".mozilla/firefox"
 MOZ_KEY = Path("/etc/apt/keyrings/packages.mozilla.org.asc")
 MOZ_LIST = Path("/etc/apt/sources.list.d/mozilla.list")
 MOZ_PIN = Path("/etc/apt/preferences.d/mozilla")
+APT_SOURCES_LIST = Path("/etc/apt/sources.list")
+APT_SOURCES_DIR = Path("/etc/apt/sources.list.d")
+APT_PREFS_DIR = Path("/etc/apt/preferences.d")
+MOZ_REPO_URI = "https://packages.mozilla.org/apt"
 UDEV_RULE = Path("/etc/udev/rules.d/99-vhci.rules")
 UDEV_RULE_TEXT = 'KERNEL=="vhci", TAG+="uaccess", GROUP="plugdev", MODE="0660"\n'
 MODULES_CONF = Path("/etc/modules-load.d/hci_vhci.conf")
@@ -286,6 +290,7 @@ class Action:
     required: bool = True   # False: context only; `check` ignores it and a failed re-check is not an error
     needs_relogin: bool = False  # under --yes a failed re-check waits for a new login (exit 3), not exit 1
     hint: str | Callable[[], str] = ""  # shown if the check still fails after apply (lazy when a callable)
+    problem: Callable[[], str | None] = lambda: None  # why an unmet check is unmet, shown by status under the row
 
 
 def show_actions(actions: list[Action]) -> list[Action]:
@@ -295,6 +300,8 @@ def show_actions(actions: list[Action]) -> list[Action]:
         say(f"  [{'x' if ok else ' '}] {action.name}")
         if not ok:
             pending.append(action)
+            if reason := action.problem():
+                say(f"      {reason}")
     return pending
 
 
@@ -743,8 +750,77 @@ def firefox_running() -> bool:
     return bool(out(["pgrep", "-x", "firefox"]) or out(["pgrep", "-f", "/snap/firefox/"]))
 
 
+def _moz_uri(uri: str) -> bool:
+    return uri.rstrip("/").removeprefix("http://").removeprefix("https://") == MOZ_REPO_URI.removeprefix("https://")
+
+
+def _moz_one_line(path: Path) -> list[str | None]:
+    """Signed-By of every enabled one-line `deb`/`deb-src` entry for the Mozilla repo (None: no option)."""
+    found: list[str | None] = []
+    for raw in (read_text(path) or "").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        match = re.match(r"deb(?:-src)?\s+(?:\[([^\]]*)\]\s+)?(\S+)\s+(\S+)", line)
+        if not match or not _moz_uri(match.group(2)) or match.group(3) != "mozilla":
+            continue
+        signed = re.search(r"(?:^|\s)signed-by=(\S+)", match.group(1) or "")
+        found.append(signed.group(1) if signed else None)
+    return found
+
+
+def _moz_deb822(path: Path) -> list[str | None]:
+    """Signed-By of every enabled deb822 stanza that names the Mozilla repo and suite."""
+    found: list[str | None] = []
+    for stanza in re.split(r"\n\s*\n", read_text(path) or ""):
+        fields: dict[str, str] = {}
+        key = ""
+        for line in stanza.splitlines():
+            if line.startswith("#"):
+                continue
+            if line[:1].isspace() and key:
+                fields[key] += " " + line.strip()
+            elif ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip().lower()
+                fields[key] = value.strip()
+        if fields.get("enabled", "yes").lower() in ("no", "false", "0"):
+            continue
+        if any(_moz_uri(u) for u in fields.get("uris", "").split()) and "mozilla" in fields.get("suites", "").split():
+            found.append(fields.get("signed-by") or None)
+    return found
+
+
+def mozilla_definitions() -> list[tuple[Path, str | None]]:
+    """Every file that already defines the Mozilla apt repo, with its Signed-By: apt reads sources.list,
+    *.list and *.sources, whoever wrote them (this installer or another tool)."""
+    found: list[tuple[Path, str | None]] = []
+    for path in [APT_SOURCES_LIST, *sorted(APT_SOURCES_DIR.glob("*.list"))]:
+        found += [(path, signed) for signed in _moz_one_line(path)]
+    for path in sorted(APT_SOURCES_DIR.glob("*.sources")):
+        found += [(path, signed) for signed in _moz_deb822(path)]
+    return found
+
+
+def mozilla_pinned() -> bool:
+    return any(re.search(r"^Pin:\s*origin\s+\"?packages\.mozilla\.org\"?\s*$", read_text(path) or "", re.M)
+               for path in sorted(APT_PREFS_DIR.glob("*")) if path.is_file())
+
+
+def mozilla_conflict() -> str | None:
+    """The state in which apt fails system-wide (`Conflicting values set for option Signed-By`): the repo is
+    defined more than once with different keys. Names the files and the removal that fixes it; deletes nothing."""
+    defs = mozilla_definitions()
+    if len({signed for _, signed in defs}) < 2:  # an unset Signed-By differs from a set one
+        return None
+    detail = "; ".join(f"{path} (Signed-By {signed or 'unset'})" for path, signed in defs)
+    keep = next((signed for path, signed in defs if path != MOZ_LIST), defs[0][1])  # prefer another tool's file over ours
+    extra = list(dict.fromkeys(path for path, signed in defs if signed != keep))  # what is left has one key
+    return (f"packages.mozilla.org/apt is defined more than once with different keys, so apt fails with "
+            f"'E: Conflicting values set for option Signed-By': {detail}. Keep one definition: "
+            + "; ".join(f"sudo rm {path}" for path in extra))
+
+
 def mozilla_repo_ok() -> bool:
-    return (MOZ_KEY.exists() and MOZ_LIST.exists() and MOZ_PIN.exists()
+    return (bool(mozilla_definitions()) and not mozilla_conflict() and mozilla_pinned()
             and "packages.mozilla.org" in out(["apt-cache", "policy", "firefox"], timeout=60))
 
 
@@ -768,11 +844,30 @@ def profile_copied() -> bool:
 
 
 def install_mozilla_repo() -> None:
-    run(["install", "-d", "-m0755", "/etc/apt/keyrings"], sudo=True)
-    run(["curl", "-fsSL", "https://packages.mozilla.org/apt/repo-signing-key.gpg", "-o", str(MOZ_KEY)], sudo=True)
-    sudo_write(MOZ_LIST, f"deb [signed-by={MOZ_KEY}] https://packages.mozilla.org/apt mozilla main\n")
-    sudo_write(MOZ_PIN, "Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n")
-    run(["apt-get", "update"], sudo=True)
+    conflict = mozilla_conflict()
+    if conflict and DRY_RUN:
+        say(f"  would stop: {conflict}")
+        return
+    if conflict:
+        raise StepError(conflict + ". Nothing was changed; re-run `passkey-qr install` afterwards.")
+    wrote = False
+    if not mozilla_definitions():  # another tool's definition (any file, any key) already provides the repo
+        run(["install", "-d", "-m0755", "/etc/apt/keyrings"], sudo=True)
+        run(["curl", "-fsSL", "https://packages.mozilla.org/apt/repo-signing-key.gpg", "-o", str(MOZ_KEY)], sudo=True)
+        sudo_write(MOZ_LIST, f"deb [signed-by={MOZ_KEY}] {MOZ_REPO_URI} mozilla main\n")
+        wrote = True
+    if not mozilla_pinned():
+        sudo_write(MOZ_PIN, "Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n")
+        wrote = True
+    if not wrote:
+        return
+    try:
+        run(["apt-get", "update"], sudo=True)
+    except subprocess.CalledProcessError as err:
+        conflict = mozilla_conflict()
+        if conflict:
+            raise StepError(f"apt-get update failed (exit {err.returncode}): {conflict}") from err
+        raise
 
 
 def need_firefox_closed() -> None:
@@ -929,7 +1024,8 @@ def set_install_default() -> None:
 
 def firefox_actions() -> list[Action]:
     return [
-        Action("Mozilla apt repo + pin (so apt does not bring the snap back)", mozilla_repo_ok, install_mozilla_repo),
+        Action("Mozilla apt repo + pin (so apt does not bring the snap back)", mozilla_repo_ok, install_mozilla_repo,
+               hint=lambda: mozilla_conflict() or "", problem=mozilla_conflict),
         Action("Firefox deb installed",
                deb_firefox_installed,
                # Ubuntu's transitional package has epoch 1:, so Mozilla's deb counts as a downgrade
@@ -2365,6 +2461,8 @@ def cmd_check(_: argparse.Namespace) -> None:
     unmet = unmet_rows(status_rows())
     for label in unmet:
         say(f"  missing: {label}")
+    if unmet and (conflict := mozilla_conflict()):
+        say(f"  {conflict}")
     sys.exit(3 if unmet else 0)
 
 
