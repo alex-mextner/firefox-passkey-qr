@@ -102,7 +102,8 @@ Home Assistant tokens are never logged.
   A `RestartPreventExitStatus=` from another drop-in still wins: `passwords-appd` keeps `=1` on purpose, because
   its exit 1 now only means "the bus name is already owned" (another instance is alive) and restarting would
   only fight it; unreadable data or a locked keyring exit 75 and are retried.
-* **Request watcher** - `passkey-qr-watch.service` runs `passkey-qr watch` from a copy of the installer in
+* **Request watcher** - `passkey-qr-watch.service` runs `passkey-qr watch` from a copy of the program (the
+  `passkey-qr` script and the `passkey_qr/` package next to it) in
   `~/.local/libexec/passkey-qr/` (`install` refreshes it after you update the checkout; a stale copy does not fail
   `check`). It is **blocked on the session bus** (`busctl --user monitor`, woken only by the Firefox helper's
   `Registry.Register` and `CreateCredential`/`GetCredential` calls to the portal): no timer, no polling,
@@ -209,3 +210,11 @@ Report breakage as issues.
   [preferred]
   org.freedesktop.impl.portal.experimental.Credential=credentialsd
   ```
+
+## Layout
+
+`passkey-qr` is the entry point; the program is the `passkey_qr/` package next to it, one module per step
+(`bluetooth`, `firefox`, `credentialsd`, `extension`, `selfheal`), the health check and watcher (`health`), the
+shared plumbing (`core`, `apt`, `build`) and the command line (`cli`). A module reaches another module's names
+qualified (`core.run`), never imported by name, so a test patches a name where it is defined (`tests/support.py`).
+Tests: `python3 -m unittest discover -s tests`, one `tests/test_<topic>.py` per topic.
