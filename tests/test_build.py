@@ -2,7 +2,9 @@
 
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from support import apt, build, core, credentialsd
@@ -41,11 +43,28 @@ class Dependencies(unittest.TestCase):
                 subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"toolchain not installed")):
             self.assertFalse(credentialsd.rust_ok())
 
-    def test_local_tool_directories_come_first_exactly_once(self):
-        with mock.patch.dict(os.environ, {"PATH": f"/usr/bin:{build.LOCAL_BIN}:/bin"}):
+    def test_local_tool_directories_then_system_directories_come_first_exactly_once(self):
+        brew = "/home/linuxbrew/.linuxbrew/bin"
+        with mock.patch.dict(os.environ, {"PATH": f"{build.LOCAL_BIN}:{brew}:/usr/bin:/bin:/opt/x"}):
             build.ensure_local_bin_on_path()
             build.ensure_local_bin_on_path()
-            self.assertEqual(os.environ["PATH"], f"{core.CARGO_BIN}:{build.LOCAL_BIN}:/usr/bin:/bin")
+            self.assertEqual(os.environ["PATH"], ":".join(
+                [str(core.CARGO_BIN), str(build.LOCAL_BIN), *build.SYSTEM_PATH, brew, "/opt/x"]))
+
+    def test_a_user_path_with_brew_first_still_resolves_python3_to_the_system_one(self):
+        with mock.patch.dict(os.environ, {"PATH": "/home/linuxbrew/.linuxbrew/bin:/usr/bin"}):
+            build.ensure_local_bin_on_path()
+            self.assertLess(os.environ["PATH"].index("/usr/bin"), os.environ["PATH"].index("/home/linuxbrew"))
+
+    def test_blueprint_is_configured_from_scratch_so_a_stale_build_dir_cannot_keep_a_wrong_python(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(core, "SRC_DIR", Path(tmp)), mock.patch.object(
+                core, "run"), mock.patch.object(build, "run_resolving") as resolving:
+            (Path(tmp) / "blueprint-compiler" / ".git").mkdir(parents=True)
+            build.build_blueprint()
+        setup = resolving.call_args_list[0].args[0]
+        self.assertEqual(setup[:3], ["meson", "setup", "_build"])
+        self.assertIn("--wipe", setup)
+        self.assertNotIn("--reconfigure", setup)
 
 
 if __name__ == "__main__":

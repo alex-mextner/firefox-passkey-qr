@@ -13,6 +13,7 @@ BLUEPRINT_REPO = "https://gitlab.gnome.org/GNOME/blueprint-compiler.git"
 BLUEPRINT_TAG = "v0.20.4"
 
 LOCAL_BIN = core.HOME / ".local/bin"
+SYSTEM_PATH = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
 
 ERROR_LINE = re.compile(r"error|ERROR|FAILED|panicked|not found")  # what a failed build's excerpt keeps
 
@@ -23,8 +24,12 @@ def version_of(tool: str) -> tuple[int, ...]:
 
 
 def ensure_local_bin_on_path() -> None:
-    """~/.cargo/bin (rustup's cargo) and ~/.local/bin (blueprint-compiler) first, once, in that order."""
-    wanted = [str(core.CARGO_BIN), str(LOCAL_BIN)]
+    """~/.cargo/bin (rustup's cargo), ~/.local/bin (blueprint-compiler), then the system dirs, once, in that order.
+
+    The system dirs beat the rest (Linuxbrew...) because every build here links apt's -dev packages: a brew python3
+    has no `gi`, and meson would install blueprint-compiler into brew's site-packages under ~/.local.
+    """
+    wanted = [str(core.CARGO_BIN), str(LOCAL_BIN), *SYSTEM_PATH]
     rest = [p for p in os.environ.get("PATH", "").split(":") if p and p not in wanted]
     os.environ["PATH"] = ":".join(wanted + rest)
 
@@ -44,7 +49,8 @@ def build_blueprint() -> None:
             src.parent.mkdir(parents=True, exist_ok=True)
         core.run(["git", "clone", BLUEPRINT_REPO, str(src)])
     core.run(["git", "-C", str(src), "checkout", BLUEPRINT_TAG])
-    run_resolving(["meson", "setup", "_build", "--prefix", str(core.HOME / ".local"), "--reconfigure"], src)
+    # --wipe, not --reconfigure: a cached build dir keeps whichever python3 the first configure found
+    run_resolving(["meson", "setup", "_build", "--prefix", str(core.HOME / ".local"), "--wipe"], src)
     run_resolving(["meson", "compile", "-C", "_build"], src)
     core.run(["meson", "install", "-C", "_build"], cwd=src)  # user prefix: no sudo
     ensure_local_bin_on_path()
